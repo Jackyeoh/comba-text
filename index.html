@@ -1,0 +1,840 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Signal Trace — Combat Prototype</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0 auto;
+    max-width: 950px;
+    background: #0b0f14;
+    color: #cbd5e1;
+    font-family: "JetBrains Mono", Consolas, monospace;
+    font-size: 14px;
+    line-height: 1.5;
+    padding: 20px;
+  }
+  h1 { font-size: 18px; color: #7dd3fc; margin: 0 0 4px; letter-spacing: 1px; }
+  .sub { color: #64748b; margin-bottom: 16px; font-size: 12px; }
+  .layout { display: flex; flex-direction: column; gap: 20px; align-items: stretch; }
+  .row-main { display: flex; gap: 24px; align-items: flex-start; }
+  .side-col { display: flex; flex-direction: column; gap: 16px; flex: 1; min-width: 240px; }
+
+  /* Board */
+  .board {
+    display: grid;
+    grid-template-columns: repeat(5, 64px);
+    grid-template-rows: repeat(5, 64px);
+    gap: 4px;
+    background: #111827;
+    padding: 6px;
+    border: 1px solid #1f2937;
+  }
+  .tile {
+    position: relative;
+    background: #0e1621;
+    border: 1px solid #1c2733;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    color: #94a3b8;
+    user-select: none;
+  }
+  .tile .abbr { font-weight: bold; font-size: 13px; }
+  .tile.prog { border-color: #334155; }
+  .tile.prog.strike  { color: #f87171; }
+  .tile.prog.cstrike { color: #fb923c; }
+  .tile.prog.guard   { color: #38bdf8; }
+  .tile.prog.combo   { color: #fbbf24; }
+  .tile.prog.delay   { color: #c084fc; }
+  .tile.prog.empower { color: #4ade80; }
+  .tile.empowered { box-shadow: inset 0 0 0 2px #4ade80; }
+  .tile .empbadge { position:absolute; bottom:2px; left:3px; font-size:10px; color:#4ade80; }
+  .tile.corrupt { background:#241026; }
+  .tile.corrupt.prog { border-color:#a21caf; }
+  .tile .debbadge { position:absolute; top:2px; left:3px; font-size:10px; color:#e879f9; }
+  .tile.burning { background:#2a1206; }
+  .tile.burning.prog { border-color:#ea580c; }
+  .tile .burnbadge { position:absolute; top:1px; left:2px; font-size:11px; }
+  /* BOMBER telegraph: warning ring (cd 2), intensified pulsing ring (cd 1) */
+  .bomb-marker { position:absolute; inset:12px; border:2px solid #ef4444; border-radius:50%; box-shadow:0 0 5px #ef4444; z-index:4; pointer-events:none; opacity:0.75; }
+  .bomb-marker::after { content:""; position:absolute; inset:5px; border:2px solid #ef4444; border-radius:50%; }
+  .bomb-marker.intense { inset:6px; border-color:#fca5a5; box-shadow:0 0 12px 2px #ef4444; opacity:1; animation:bomb-pulse .5s ease-in-out infinite; }
+  @keyframes bomb-pulse { 0%,100%{ transform:scale(1);} 50%{ transform:scale(1.18);} }
+  .tile .arms {
+    position: absolute; top: 2px; right: 4px;
+    font-size: 10px; color: #22c55e;
+  }
+  .tile.pathmark::after {
+    content: ""; position: absolute; inset: 0;
+    background: rgba(34,197,94, var(--path-alpha, 0.10));
+    pointer-events: none;
+  }
+  .tile.signal { box-shadow: inset 0 0 0 2px #22d3ee; }
+  .tile.signal .dot {
+    position: absolute; width: 14px; height: 14px; border-radius: 50%;
+    background: #22d3ee; box-shadow: 0 0 10px #22d3ee; bottom: 3px;
+  }
+  .tile.firing { background: #1e293b !important; box-shadow: inset 0 0 0 2px #fde047; }
+  .tile.draggable { cursor: grab; }
+  .tile.draggable:active { cursor: grabbing; }
+  .tile.drop-hover { outline: 2px dashed #22d3ee; outline-offset: -2px; }
+  /* walls sit on the gap between tiles */
+  .wall { position:absolute; background:#f97316; box-shadow:0 0 6px #f97316; z-index:3; }
+  .wall.wall-r { top:-2px; bottom:-2px; right:-4px; width:4px; }
+  .wall.wall-d { left:-2px; right:-2px; bottom:-4px; height:4px; }
+
+  /* Side panels */
+  .panel { min-width: 240px; }
+  .panel h2 { font-size: 13px; color: #7dd3fc; margin: 0 0 8px; text-transform: uppercase; letter-spacing: 1px; }
+
+  .hp-bar { background:#1f2937; height: 16px; position: relative; margin: 4px 0 2px; }
+  .hp-fill { background:#22c55e; height: 100%; transition: width .2s; }
+  .hp-fill.enemy { background:#ef4444; }
+  .block-badge { color:#38bdf8; font-size: 12px; }
+
+  #enemies { display:flex; gap:10px; flex-wrap:wrap; }
+  .enemy {
+    border: 1px solid #1f2937; padding: 8px; background:#0e1621;
+    width: 170px; flex:0 0 auto;
+  }
+  .enemy.dead { opacity: 0.35; }
+  .enemy.targeted { border-color:#f87171; box-shadow: inset 0 0 0 1px #f87171; }
+  .enemy:not(.dead):hover { border-color:#64748b; }
+  /* cd 1 → about to fire: breathing red↔white flash */
+  .enemy.imminent { animation: breathe-imminent 0.9s ease-in-out infinite; }
+  @keyframes breathe-imminent {
+    0%,100% { border-color:#ef4444; box-shadow: inset 0 0 0 2px #ef4444; }
+    50%     { border-color:#ffffff; box-shadow: inset 0 0 0 2px #ffffff; }
+  }
+  .enemy .name { color:#e2e8f0; font-weight: bold; }
+  .cd { color:#f59e0b; font-size: 12px; }
+  .cd.ready { color:#ef4444; font-weight: bold; }
+
+  .stat-row { display:flex; justify-content:space-between; }
+  .strength { color:#22d3ee; font-weight: bold; }
+
+  .log {
+    background:#0e1621; border:1px solid #1f2937; padding:8px;
+    height: 180px; overflow-y:auto; font-size: 12px; width: 100%;
+  }
+  .log div { margin-bottom: 2px; }
+  .log .dmg { color:#f87171; }
+  .log .blk { color:#38bdf8; }
+  .log .cmb { color:#fbbf24; }
+  .log .dly { color:#c084fc; }
+  .log .sys { color:#64748b; }
+  .log .win { color:#22c55e; font-weight:bold; }
+  .log .lose { color:#ef4444; font-weight:bold; }
+
+  .keys { color:#64748b; font-size:12px; margin-top:12px; }
+  .keys b { color:#94a3b8; }
+  button {
+    background:#1e293b; color:#7dd3fc; border:1px solid #334155;
+    padding:6px 12px; font-family:inherit; cursor:pointer; margin-top:8px;
+  }
+  button:hover { background:#334155; }
+  button:disabled { opacity:0.4; cursor:not-allowed; }
+  .banner { font-size:22px; margin: 8px 0; min-height: 28px; }
+  .tools { margin-top:14px; border-top:1px solid #1f2937; padding-top:10px; }
+  .tool-row { display:flex; align-items:center; gap:6px; margin-bottom:6px; }
+  .tool-row label { color:#64748b; font-size:12px; width:88px; }
+  .tool-row select { background:#0e1621; color:#cbd5e1; border:1px solid #334155; font-family:inherit; padding:4px; }
+  .tool-row button { margin-top:0; padding:4px 10px; }
+</style>
+</head>
+<body>
+  <h1>SIGNAL TRACE // combat prototype</h1>
+  <div class="sub">Steer the signal across programs to arm them, then <b>SPACE</b> to trace back and fire the chain.</div>
+
+  <div class="banner" id="banner"></div>
+
+  <div class="layout">
+    <!-- Row 1: enemies -->
+    <div class="panel row-enemies">
+      <h2 id="enemiesTitle">Enemies</h2>
+      <div id="enemies"></div>
+    </div>
+
+    <!-- Row 2: board + side column (player info + desc/debug controls) -->
+    <div class="row-main">
+      <div class="board" id="board"></div>
+      <div class="side-col">
+        <div class="panel">
+          <h2>Player</h2>
+          <div class="stat-row"><span>HP</span><span id="hpText"></span></div>
+          <div class="hp-bar"><div class="hp-fill" id="hpFill"></div></div>
+          <div class="block-badge" id="blockText"></div>
+          <div class="stat-row" style="margin-top:8px">
+            <span>Combo</span><span id="comboText"></span>
+          </div>
+          <div class="stat-row">
+            <span>Signal strength</span><span class="strength" id="strengthText"></span>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h2>Controls</h2>
+          <div class="keys">
+            <b>Setup:</b> drag a program onto an empty tile to move it, or onto another to swap — then START.<br>
+            <b>Combat:</b> Arrows / WASD move signal &nbsp;·&nbsp; <b>Space</b> fire chain &nbsp;·&nbsp; <b>click an enemy</b> to target it. Layout is locked.<br>
+            Each move = +1 combo (+10% signal strength). Moving decrements enemy cooldowns. Orange bars are walls.
+          </div>
+          <button id="startBtn">▶ Start combat</button>
+          <button id="reset">Reset run</button>
+
+          <div class="tools">
+            <div class="tool-row">
+              <label>Add program</label>
+              <select id="addProgSel"></select>
+              <button id="addProgBtn">+ place</button>
+            </div>
+            <div class="tool-row">
+              <label>Add enemy</label>
+              <select id="addEnemySel"></select>
+              <button id="addEnemyBtn">+ spawn</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Row 3: log -->
+    <div class="panel row-log">
+      <h2>Log</h2>
+      <div class="log" id="log"></div>
+    </div>
+  </div>
+
+<script>
+// ---------- Config ----------
+const GRID = 5;
+const PROGRAMS = {
+  strike:  { abbr:'STR', name:'STRIKE',  desc:'deal 10 dmg' },
+  cstrike: { abbr:'CST', name:'C-STRIKE',desc:'deal 8 dmg, +3 per C-STRIKE this signal' },
+  guard:   { abbr:'GRD', name:'GUARD',   desc:'gain 5 block' },
+  combo:   { abbr:'CMB', name:'COMBO',   desc:'on arm: +3 combo' },
+  delay:   { abbr:'DLY', name:'DELAY',   desc:'on arm: +2 cd to a random enemy ability' },
+  empower: { abbr:'EMP', name:'EMPOWER', desc:'on arm: +30% base dmg to adjacent programs (this signal)' },
+};
+const STRIKE_DMG = 10, GUARD_BLOCK = 5, COMBO_GAIN = 3, DELAY_CD = 2;
+const CSTRIKE_BASE = 8, CSTRIKE_RAMP = 3, EMPOWER_PCT = 0.30, DEBUFF_PCT = 0.20, BURN_DMG = 1;
+const BOMB_HIT = 30, BOMB_MISS = 10;
+const PROGRAM_COUNT = 7;         // total programs placed (incl. 1 strike + 1 guard)
+const CHAIN_STEP_MS = 260;
+
+// Enemy roster for the stage — one of each type.
+const ENEMY_TYPES = {
+  gnat:   { name:'GNAT',   hp:45,       cd:1,  behavior:'damage', dmg:2 },
+  daemon: { name:'DAEMON', hp:70,       cd:5,  behavior:'damage', dmg:6 },  // the original enemy
+  warden: { name:'WARDEN', hp:80, cd:6,  behavior:'wall' },
+  siege:  { name:'SIEGE',  hp:80, cd:12, behavior:'ramp',   dmg:8 },
+  blight: { name:'BLIGHT', hp:60, cd:8,  behavior:'debuff' },  // corrupts a tile; spreads each move
+  ember:  { name:'EMBER',  hp:60, cd:4,  behavior:'burn' },    // burns a tile; 1 dmg on step-in
+  bomber: { name:'BOMBER', hp:35, cd:7,  behavior:'bomb' },    // telegraphed bomb: 30 on you, 10 if you flee
+};
+const WAVE_COUNT = 3, WAVE_SIZE = 3;   // 3 waves of 3 enemies rolled from the roster
+
+// ---------- State ----------
+let state;
+
+function rand(n){ return Math.floor(Math.random()*n); }
+function key(r,c){ return r+','+c; }
+
+function rollType(){ const r = Object.keys(ENEMY_TYPES); return r[rand(r.length)]; }
+function makeEnemy(typeKey, id){
+  const t = ENEMY_TYPES[typeKey];
+  return {
+    id, type: typeKey, name: t.name,
+    hp: t.hp, maxHp: t.hp, alive: true,
+    cd: Math.max(1, t.cd - rand(3)),   // 0-2 cd advancement, min 1
+    sinceAttacked: 0,                  // moves since last struck (SIEGE ramp)
+    bombTarget: null,                  // BOMBER: locked tile once telegraphed
+  };
+}
+
+function newState(){
+  // place programs: 1 strike, 1 guard, rest random
+  const bag = ['strike','guard'];
+  const pool = ['strike','cstrike','guard','combo','delay','empower'];
+  for(let i=0;i<PROGRAM_COUNT-2;i++) bag.push(pool[rand(pool.length)]);
+  // ensure at least the required ones present (they are)
+  // cluster placement: pick a center, take the nearest N tiles so programs
+  // sit in a compact group (the signal later spawns on one of them).
+  const cr = 1 + rand(GRID-2), cc = 1 + rand(GRID-2);
+  const cells = [];
+  for(let r=0;r<GRID;r++) for(let c=0;c<GRID;c++)
+    cells.push({ r, c, d: Math.abs(r-cr)+Math.abs(c-cc), j: Math.random() });
+  cells.sort((a,b)=> a.d-b.d || a.j-b.j);
+  // shuffle the program bag so type placement within the cluster is random
+  for(let i=bag.length-1;i>0;i--){ const j=rand(i+1); [bag[i],bag[j]]=[bag[j],bag[i]]; }
+  const programs = {}; // "r,c" -> type
+  bag.forEach((type,i)=>{ programs[key(cells[i].r,cells[i].c)]=type; });
+
+  const enemies = [];
+  for(let i=0;i<WAVE_SIZE;i++) enemies.push(makeEnemy(rollType(), i));   // wave 1
+
+  return {
+    programs, enemies, nextEnemyId: enemies.length,
+    wave: 1, maxWaves: WAVE_COUNT,
+    player: { hp:100, maxHp:100, block:0 },
+    combo: 0,
+    signal: null,        // {r,c}
+    path: [],            // [{r,c}] visited in order (arm sequence source)
+    walls: new Set(),    // edge keys the signal cannot cross (see edgeKey)
+    corrupt: new Set(),  // tileKey debuffed by BLIGHT (-20% power); spreads each move
+    burn: new Set(),     // tileKey set alight by EMBER (1 dmg on step-in)
+    empower: {},         // tileKey -> empower stacks, reset each signal
+    cstrikeCount: 0,     // C-STRIKE activations so far this signal (ramp)
+    targetId: null,      // enemy the player's strikes aim at (null = random)
+    phase: 'setup',      // setup | moving | activating | over
+    over: false,
+  };
+}
+
+function strengthMult(){ return 1 + 0.1 * state.combo; }
+
+// ---------- Targeting ----------
+// Explicit selection (state.targetId) or, when unset/dead, a random living enemy.
+function selectedTarget(){
+  return (state.targetId!=null) ? state.enemies.find(e=>e.id===state.targetId && e.alive) : null;
+}
+function strikeTarget(){
+  const sel = selectedTarget();
+  if(sel) return sel;
+  const alive = state.enemies.filter(e=>e.alive);
+  return alive.length ? alive[rand(alive.length)] : null;   // random when none selected
+}
+function setTarget(id){
+  const e = state.enemies.find(x=>x.id===id);
+  if(!e || !e.alive) return;
+  state.targetId = id;
+  render(true);
+}
+
+// ---------- Signal spawn ----------
+function programTiles(){ return Object.keys(state.programs); }
+
+function spawnSignal(){
+  const tiles = programTiles();
+  const k = tiles[rand(tiles.length)];
+  const [r,c] = k.split(',').map(Number);
+  state.signal = { r, c };
+  state.path = [{ r, c }];   // spawn tile is first armed step
+  state.combo = 0;
+  state.empower = {};        // per-signal buffs reset
+  state.cstrikeCount = 0;
+  state.phase = 'moving';
+  log('sys','— signal spawned on '+PROGRAMS[state.programs[k]].name+' —');
+  armTile(k);   // spawn tile counts as armed
+  render();
+}
+
+// ---------- Movement ----------
+function tryMove(dr,dc){
+  if(state.phase!=='moving' || state.over) return;
+  const nr = state.signal.r + dr, nc = state.signal.c + dc;
+  if(nr<0||nr>=GRID||nc<0||nc>=GRID) return;
+  if(state.walls.has(edgeKey(state.signal, {r:nr,c:nc}))){
+    log('sys','✕ blocked by a wall'); return;
+  }
+  state.signal = { r:nr, c:nc };
+  state.path.push({ r:nr, c:nc });
+  state.combo += 1;                 // each move +1 combo
+  const nk = key(nr,nc);
+  if(state.corrupt.delete(nk)) log('sys','◇ cleansed corruption @'+nk);  // moving in removes it
+  if(state.burn.has(nk)) dealToPlayer(BURN_DMG, 'BURN @'+nk);            // burning tile bites on step-in
+  armTile(nk);                      // on-arm hooks fire as the signal passes through
+  enemyTick();                      // moving advances enemy cooldowns
+  render();
+}
+
+// Edge id between two adjacent cells: top-left cell + 'R' (right) or 'D' (down).
+function edgeKey(a,b){
+  if(a.r===b.r) return a.r+','+Math.min(a.c,b.c)+':R';
+  return Math.min(a.r,b.r)+','+a.c+':D';
+}
+
+// On-arm hooks fire the moment the signal enters a program tile (repeats each pass).
+// STRIKE/GUARD do nothing here and resolve in the trace-back chain; COMBO & DELAY
+// resolve on arm instead.
+function armTile(k){
+  const type = state.programs[k];
+  if(type==='delay') doDelay();
+  else if(type==='combo'){
+    state.combo += COMBO_GAIN;
+    log('cmb','COMBO (armed) → +'+COMBO_GAIN+' combo (now '+state.combo+')');
+  }
+  else if(type==='empower') doEmpower(k);
+}
+
+// EMPOWER buffs its 4 orthogonal neighbours (+30% base dmg) for this signal.
+function doEmpower(k){
+  const [r,c] = k.split(',').map(Number);
+  let n=0;
+  [[-1,0],[1,0],[0,-1],[0,1]].forEach(([dr,dc])=>{
+    const nk = key(r+dr, c+dc);
+    if(state.programs[nk]){ state.empower[nk] = (state.empower[nk]||0) + 1; n++; }
+  });
+  log('cmb','EMPOWER (armed) → +'+Math.round(EMPOWER_PCT*100)+'% base dmg to '+n+' neighbour(s)');
+}
+
+function doDelay(){
+  const alive = state.enemies.filter(e=>e.alive);
+  if(!alive.length) return;
+  const e = alive[rand(alive.length)];
+  e.cd += DELAY_CD;
+  log('dly','DELAY (armed) → '+e.name+' cooldown +'+DELAY_CD+' (now '+e.cd+')');
+}
+
+function signalKey(){ return state.signal ? key(state.signal.r, state.signal.c) : null; }
+
+function tickEnemyCd(e){
+  const t = ENEMY_TYPES[e.type];
+  e.cd -= 1;
+  // BOMBER telegraph: lock the target on 'you' two ticks out
+  if(t.behavior==='bomb' && e.cd===2 && !e.bombTarget){
+    e.bombTarget = signalKey();
+    log('dly', e.name+' → arming bomb @'+(e.bombTarget||'?'));
+  }
+  if(e.cd<=0){
+    fireAbility(e);
+    e.cd = t.cd;
+  }
+}
+
+function enemyTick(){
+  state.enemies.forEach(e=>{
+    if(!e.alive) return;
+    e.sinceAttacked += 1;             // each player move without being struck
+    tickEnemyCd(e);
+  });
+  spreadCorruption();                 // BLIGHT corruption grows one tile per move
+  checkPlayerDead();
+}
+
+// After a firing chain resolves, advance cooldowns by 1 (abilities may fire) so the
+// chain isn't "free". Not a move: no ramp increment, no corruption spread.
+function advanceCooldowns(){
+  state.enemies.forEach(e=>{ if(e.alive) tickEnemyCd(e); });
+  checkPlayerDead();
+}
+
+function fireAbility(e){
+  const t = ENEMY_TYPES[e.type];
+  if(t.behavior==='damage'){
+    dealToPlayer(t.dmg, e.name);
+  } else if(t.behavior==='ramp'){
+    const dmg = t.dmg + e.sinceAttacked;   // +1 per move it hasn't been attacked
+    dealToPlayer(dmg, e.name+' (ramp '+e.sinceAttacked+')');
+  } else if(t.behavior==='wall'){
+    placeWall(e);
+  } else if(t.behavior==='debuff'){
+    seedCorruption(e);
+  } else if(t.behavior==='burn'){
+    burnTile(e);
+  } else if(t.behavior==='bomb'){
+    detonateBomb(e);
+  }
+}
+
+// BOMBER: 30 dmg if the signal is on the telegraphed tile, else 10.
+function detonateBomb(e){
+  const target = e.bombTarget || signalKey();
+  const direct = target!=null && signalKey()===target;
+  const dmg = direct ? BOMB_HIT : BOMB_MISS;
+  dealToPlayer(dmg, e.name+(direct?' — DIRECT HIT':' — near miss')+' @'+target);
+  e.bombTarget = null;
+}
+
+// A tile can hold at most one modifier (corruption OR burn).
+function tileHasMod(k){ return state.corrupt.has(k) || state.burn.has(k); }
+
+// BLIGHT: corrupt a random modifier-free tile (-20% power to a program on it).
+function seedCorruption(e){
+  const free=[];
+  for(let r=0;r<GRID;r++) for(let c=0;c<GRID;c++){ const k=key(r,c); if(!tileHasMod(k)) free.push(k); }
+  if(!free.length) return;
+  const k = free[rand(free.length)];
+  state.corrupt.add(k);
+  log('dly',e.name+' → corrupted @'+k);
+}
+
+// EMBER: set a random modifier-free tile alight (1 dmg when the signal steps in).
+function burnTile(e){
+  const free=[];
+  for(let r=0;r<GRID;r++) for(let c=0;c<GRID;c++){ const k=key(r,c); if(!tileHasMod(k)) free.push(k); }
+  if(!free.length) return;
+  const k = free[rand(free.length)];
+  state.burn.add(k);
+  log('dly',e.name+' → burning @'+k);
+}
+
+// Each move the corruption expands to one random modifier-free tile adjacent to it.
+function spreadCorruption(){
+  if(!state.corrupt.size) return;
+  if(!state.enemies.some(e=>e.alive && ENEMY_TYPES[e.type].behavior==='debuff')) return;
+  const frontier = new Set();
+  state.corrupt.forEach(k=>{
+    const [r,c] = k.split(',').map(Number);
+    [[-1,0],[1,0],[0,-1],[0,1]].forEach(([dr,dc])=>{
+      const nr=r+dr, nc=c+dc, nk=key(nr,nc);
+      if(nr>=0&&nr<GRID&&nc>=0&&nc<GRID && !tileHasMod(nk)) frontier.add(nk);
+    });
+  });
+  if(!frontier.size) return;
+  const arr = [...frontier];
+  const nk = arr[rand(arr.length)];
+  state.corrupt.add(nk);
+  log('dly','corruption spreads @'+nk);
+}
+
+function placeWall(e){
+  // candidate edges: both adjacent tiles have a program; else any edge.
+  const withProg=[], any=[];
+  for(let r=0;r<GRID;r++) for(let c=0;c<GRID;c++){
+    if(c+1<GRID){ const k=r+','+c+':R'; if(!state.walls.has(k)){ any.push(k);
+      if(state.programs[key(r,c)]&&state.programs[key(r,c+1)]) withProg.push(k); } }
+    if(r+1<GRID){ const k=r+','+c+':D'; if(!state.walls.has(k)){ any.push(k);
+      if(state.programs[key(r,c)]&&state.programs[key(r+1,c)]) withProg.push(k); } }
+  }
+  const src = withProg.length ? withProg : any;
+  if(!src.length){ log('sys',e.name+' found nowhere to wall'); return; }
+  const w = src[rand(src.length)];
+  state.walls.add(w);
+  log('dly',e.name+' → wall raised'+(withProg.length?' between programs':'')+' @'+w);
+}
+
+function dealToPlayer(amt, src){
+  let dmg = amt;
+  if(state.player.block>0){
+    const absorbed = Math.min(state.player.block, dmg);
+    state.player.block -= absorbed;
+    dmg -= absorbed;
+    log('blk', src+' hits for '+amt+' ('+absorbed+' blocked)');
+  } else {
+    log('dmg', src+' hits for '+amt);
+  }
+  state.player.hp -= dmg;
+}
+
+function checkPlayerDead(){
+  if(state.player.hp<=0 && !state.over){
+    state.player.hp=0;
+    state.over=true; state.phase='over';
+    banner('💀 SYSTEM BREACHED', '#ef4444');
+    log('lose','You died.');
+  }
+}
+
+// ---------- Activation chain ----------
+function fireChain(){
+  if(state.phase!=='moving' || state.over) return;
+  state.phase='activating';
+  const reversed = state.path.slice().reverse(); // trace backward
+  log('sys','▶ tracing back '+reversed.length+' steps…');
+  let i=0;
+  const step = ()=>{
+    if(state.over){ return; }
+    if(i>=reversed.length){ endChain(); return; }
+    const {r,c} = reversed[i];
+    highlightFiring(r,c);
+    const k = key(r,c);
+    const type = state.programs[k];
+    if(type) activate(type, k);
+    i++;
+    render(true);
+    setTimeout(step, CHAIN_STEP_MS);
+  };
+  step();
+}
+
+function activate(type, k){
+  const s = strengthMult();
+  const emp = 1 + EMPOWER_PCT * (state.empower[k] || 0);   // empower is multiplicative w/ combo
+  const deb = state.corrupt.has(k) ? (1 - DEBUFF_PCT) : 1; // BLIGHT corruption on this tile
+  if(type==='strike'){
+    dealStrike(STRIKE_DMG * emp * deb * s, 'STRIKE', emp, deb);
+  } else if(type==='cstrike'){
+    const base = CSTRIKE_BASE + CSTRIKE_RAMP * state.cstrikeCount;   // ramps within the signal
+    state.cstrikeCount++;
+    dealStrike(base * emp * deb * s, 'C-STRIKE(base '+base+')', emp, deb);
+  } else if(type==='guard'){
+    const blk = Math.round(GUARD_BLOCK * deb * s);
+    state.player.block += blk;
+    log('blk','GUARD → +'+blk+' block ('+Math.round(s*100)+'%'+(deb<1?' ·-20%':'')+')');
+  }
+  // 'combo' / 'delay' / 'empower' resolve on-arm (see armTile), not in the trace-back chain
+}
+
+function dealStrike(raw, label, emp, deb){
+  const dmg = Math.round(raw);
+  const target = strikeTarget();
+  if(!target) return;
+  target.hp -= dmg;
+  target.sinceAttacked = 0;          // resets SIEGE ramp
+  const tags = Math.round(strengthMult()*100)+'%'+(emp>1?' ·emp '+Math.round(emp*100)+'%':'')+(deb<1?' ·-20%':'');
+  log('dmg', label+' → '+target.name+' for '+dmg+' ('+tags+')');
+  if(target.hp<=0){ target.hp=0; target.alive=false; log('sys',target.name+' destroyed'); state.targetId=null; }
+}
+
+function endChain(){
+  clearFiring();
+  // wave clear check
+  if(state.enemies.every(e=>!e.alive)){
+    if(state.wave < state.maxWaves){
+      startWave(state.wave + 1);       // advance to the next wave, keep playing
+      spawnSignal();
+      return;
+    }
+    state.over=true; state.phase='over';
+    banner('✓ ALL WAVES CLEARED', '#22c55e');
+    log('win','You win!');
+    render();
+    return;
+  }
+  if(state.over){ render(); return; }
+  // firing the chain isn't free: tick cooldowns once (may trigger enemy abilities)
+  log('sys','chain resolved · cooldowns advance 1');
+  advanceCooldowns();
+  if(state.over){ render(); return; }   // player may have died to a triggered ability
+  // spawn next signal
+  spawnSignal();
+}
+
+// Roll a fresh wave of WAVE_SIZE enemies (dead ones stay in the roster, greyed).
+function startWave(n){
+  state.wave = n;
+  for(let i=0;i<WAVE_SIZE;i++) state.enemies.push(makeEnemy(rollType(), state.nextEnemyId++));
+  state.targetId = null;
+  // new BLIGHTs auto-cast on wave entry (older waves are already dead)
+  state.enemies.forEach(e=>{ if(e.alive && ENEMY_TYPES[e.type].behavior==='debuff') seedCorruption(e); });
+  log('sys','— WAVE '+n+' / '+state.maxWaves+' —');
+}
+
+// ---------- Rendering ----------
+const boardEl = document.getElementById('board');
+const enemiesEl = document.getElementById('enemies');
+const logEl = document.getElementById('log');
+
+let firingCell = null;
+function highlightFiring(r,c){ firingCell = key(r,c); }
+function clearFiring(){ firingCell = null; }
+
+// ---------- Drag to rearrange programs ----------
+// Only during the pre-combat setup phase; locked once combat starts.
+function canRearrange(){ return state.phase==='setup' && !state.over; }
+let dragSrc = null;
+
+function wireDrag(el, k){
+  el.addEventListener('dragstart', e=>{
+    if(!canRearrange() || !state.programs[k]){ e.preventDefault(); return; }
+    dragSrc = k; e.dataTransfer.effectAllowed='move'; e.dataTransfer.setData('text/plain',k);
+  });
+  el.addEventListener('dragover', e=>{
+    if(dragSrc==null || !canRearrange()) return;
+    e.preventDefault(); e.dataTransfer.dropEffect='move'; el.classList.add('drop-hover');
+  });
+  el.addEventListener('dragleave', ()=> el.classList.remove('drop-hover'));
+  el.addEventListener('drop', e=>{
+    e.preventDefault(); el.classList.remove('drop-hover');
+    if(dragSrc==null || dragSrc===k || !canRearrange()){ dragSrc=null; return; }
+    // move to empty tile, or swap with an occupied one
+    const a = state.programs[dragSrc], b = state.programs[k];
+    if(b===undefined){ delete state.programs[dragSrc]; state.programs[k]=a; }
+    else { state.programs[dragSrc]=b; state.programs[k]=a; }
+    log('sys','moved '+PROGRAMS[a].abbr+' → '+k+(b?' (swap '+PROGRAMS[b].abbr+')':''));
+    dragSrc=null;
+    render();
+  });
+  el.addEventListener('dragend', ()=>{ dragSrc=null; boardEl.querySelectorAll('.drop-hover').forEach(x=>x.classList.remove('drop-hover')); });
+}
+
+function render(keepFiring){
+  // board
+  boardEl.innerHTML='';
+  const pathKeys = new Set(state.path.map(p=>key(p.r,p.c)));
+  const armCount = {};
+  state.path.forEach(p=>{ const k=key(p.r,p.c); if(state.programs[k]) armCount[k]=(armCount[k]||0)+1; });
+  // recency gradient: brightest = most recently left tile, fading back toward spawn.
+  // The live signal tile is excluded (it shows its own cyan highlight).
+  const signalK = (state.phase==='moving' && state.signal) ? key(state.signal.r,state.signal.c) : null;
+  const lastIdx = {};
+  state.path.forEach((p,i)=>{ const kk=key(p.r,p.c); if(kk!==signalK) lastIdx[kk]=i; });
+  const ordered = Object.entries(lastIdx).sort((a,b)=>a[1]-b[1]).map(e=>e[0]);
+  const pathAlpha = {};
+  ordered.forEach((kk,idx)=>{ pathAlpha[kk] = ordered.length>1 ? idx/(ordered.length-1) : 1; });
+  // BOMBER telegraph markers: warn at cd 2, intensify at cd 1
+  const bombMark = {};
+  state.enemies.forEach(e=>{
+    if(e.alive && ENEMY_TYPES[e.type].behavior==='bomb' && e.bombTarget && e.cd<=2){
+      const intense = e.cd<=1;
+      if(intense || !bombMark[e.bombTarget]) bombMark[e.bombTarget] = intense;
+    }
+  });
+  for(let r=0;r<GRID;r++) for(let c=0;c<GRID;c++){
+    const k = key(r,c);
+    const t = document.createElement('div');
+    t.className='tile';
+    const type = state.programs[k];
+    if(type){ t.classList.add('prog', type);
+      t.innerHTML='<span class="abbr">'+PROGRAMS[type].abbr+'</span>';
+      if(armCount[k]) t.innerHTML+='<span class="arms">×'+armCount[k]+'</span>';
+      if(state.empower[k]){ t.classList.add('empowered'); t.innerHTML+='<span class="empbadge">+'+Math.round(EMPOWER_PCT*state.empower[k]*100)+'%</span>'; }
+      if(canRearrange()){ t.classList.add('draggable'); t.draggable=true; }
+    }
+    t.dataset.k = k;
+    wireDrag(t, k);
+    if(pathKeys.has(k) && k!==signalK){
+      t.classList.add('pathmark');
+      t.style.setProperty('--path-alpha', (0.10 + 0.42*pathAlpha[k]).toFixed(3));
+    }
+    if(state.corrupt.has(k)){ t.classList.add('corrupt'); if(type) t.innerHTML+='<span class="debbadge">-20%</span>'; }
+    if(state.burn.has(k)){ t.classList.add('burning'); t.innerHTML+='<span class="burnbadge">🔥</span>'; }
+    if(k in bombMark){ t.insertAdjacentHTML('beforeend','<div class="bomb-marker'+(bombMark[k]?' intense':'')+'"></div>'); }
+    if(state.signal && state.signal.r===r && state.signal.c===c && state.phase==='moving'){
+      t.classList.add('signal'); t.innerHTML+='<div class="dot"></div>';
+    }
+    if(keepFiring && firingCell===k) t.classList.add('firing');
+    // walls sit on this tile's right / bottom edge (child divs to avoid ::after clash)
+    if(state.walls.has(r+','+c+':R')) t.insertAdjacentHTML('beforeend','<div class="wall wall-r"></div>');
+    if(state.walls.has(r+','+c+':D')) t.insertAdjacentHTML('beforeend','<div class="wall wall-d"></div>');
+    boardEl.appendChild(t);
+  }
+  // player
+  document.getElementById('hpText').textContent = state.player.hp+' / '+state.player.maxHp;
+  document.getElementById('hpFill').style.width = (100*state.player.hp/state.player.maxHp)+'%';
+  document.getElementById('blockText').textContent = state.player.block>0 ? '🛡 '+state.player.block+' block' : '';
+  document.getElementById('comboText').textContent = state.combo;
+  document.getElementById('strengthText').textContent = Math.round(strengthMult()*100)+'%';
+  // enemies
+  const aliveCount = state.enemies.filter(e=>e.alive).length;
+  document.getElementById('enemiesTitle').textContent =
+    'Enemies — Wave '+state.wave+'/'+state.maxWaves+' ('+aliveCount+' left)';
+  enemiesEl.innerHTML='';
+  const targeted = selectedTarget();
+  state.enemies.forEach(e=>{
+    const d=document.createElement('div');
+    const isTarget = targeted && targeted.id===e.id;
+    const ready = e.alive && e.cd<=1;
+    d.className='enemy'+(e.alive?'':' dead')+(isTarget?' targeted':'')+(ready?' imminent':'');
+    d.innerHTML='<div class="name">'+(isTarget?'▸ ':'')+e.name+(e.alive?'':' ✕')+'</div>'+
+      '<div class="hp-bar"><div class="hp-fill enemy" style="width:'+(100*e.hp/e.maxHp)+'%"></div></div>'+
+      '<div>'+e.hp+' / '+e.maxHp+'</div>'+
+      (e.alive?'<div class="cd'+(ready?' ready':'')+'">'+abilityText(e)+' · cd '+Math.max(0,e.cd)+'</div>':'');
+    if(e.alive){ d.style.cursor='pointer'; d.addEventListener('click', ()=>setTarget(e.id)); }
+    enemiesEl.appendChild(d);
+  });
+  updateToolState();
+}
+
+function abilityText(e){
+  const t = ENEMY_TYPES[e.type];
+  if(t.behavior==='damage') return 'attack '+t.dmg;
+  if(t.behavior==='ramp')   return 'attack '+(t.dmg + e.sinceAttacked)+' (ramps +1/move)';
+  if(t.behavior==='wall')   return 'raise wall';
+  if(t.behavior==='debuff') return 'corrupt (spreads/move)';
+  if(t.behavior==='burn')   return 'burn a tile';
+  if(t.behavior==='bomb')   return 'bomb '+BOMB_HIT+' / '+BOMB_MISS+' if fled';
+  return '';
+}
+
+function log(cls,msg){
+  const d=document.createElement('div'); d.className=cls; d.textContent=msg;
+  logEl.appendChild(d); logEl.scrollTop=logEl.scrollHeight;
+}
+function banner(txt,color){ const b=document.getElementById('banner'); b.textContent=txt; b.style.color=color; }
+
+// ---------- Input ----------
+window.addEventListener('keydown',(e)=>{
+  const k=e.key.toLowerCase();
+  if(k==='arrowup'||k==='w') { tryMove(-1,0); e.preventDefault(); }
+  else if(k==='arrowdown'||k==='s'){ tryMove(1,0); e.preventDefault(); }
+  else if(k==='arrowleft'||k==='a'){ tryMove(0,-1); e.preventDefault(); }
+  else if(k==='arrowright'||k==='d'){ tryMove(0,1); e.preventDefault(); }
+  else if(k===' '){
+    if(state.phase==='setup') beginCombat(); else fireChain();
+    e.preventDefault();
+  }
+  else if(k==='enter'){ if(state.phase==='setup') beginCombat(); }
+});
+document.getElementById('reset').addEventListener('click', start);
+document.getElementById('startBtn').addEventListener('click', beginCombat);
+
+// ---------- Add-content dropdowns ----------
+(function populateTools(){
+  const p = document.getElementById('addProgSel');
+  Object.keys(PROGRAMS).forEach(k=>{ const o=document.createElement('option'); o.value=k; o.textContent=PROGRAMS[k].name; p.appendChild(o); });
+  const e = document.getElementById('addEnemySel');
+  Object.keys(ENEMY_TYPES).forEach(k=>{ const o=document.createElement('option'); o.value=k; o.textContent=ENEMY_TYPES[k].name; e.appendChild(o); });
+})();
+document.getElementById('addProgBtn').addEventListener('click', ()=> addProgram(document.getElementById('addProgSel').value));
+document.getElementById('addEnemyBtn').addEventListener('click', ()=> addEnemy(document.getElementById('addEnemySel').value));
+
+function addProgram(type){
+  if(!canRearrange()){ return; }   // programs locked once combat starts
+  // prefer an empty cell touching an existing program (keeps the cluster), else any empty
+  const empties=[], touching=[];
+  for(let r=0;r<GRID;r++) for(let c=0;c<GRID;c++){
+    if(state.programs[key(r,c)]) continue;
+    empties.push([r,c]);
+    if([[-1,0],[1,0],[0,-1],[0,1]].some(([dr,dc])=>state.programs[key(r+dr,c+dc)])) touching.push([r,c]);
+  }
+  const pick = (touching.length?touching:empties);
+  if(!pick.length){ log('sys','board full — no room for a program'); return; }
+  const [r,c] = pick[rand(pick.length)];
+  state.programs[key(r,c)] = type;
+  log('sys','added '+PROGRAMS[type].name+' @'+key(r,c));
+  render();
+}
+
+function addEnemy(type){
+  if(state.over){ return; }
+  const spawned = makeEnemy(type, state.nextEnemyId++);
+  state.enemies.push(spawned);
+  // BLIGHT auto-casts once on entry; during setup it waits for combat start
+  if(ENEMY_TYPES[type].behavior==='debuff' && state.phase!=='setup') seedCorruption(spawned);
+  log('sys','spawned '+spawned.name);
+  render(true);
+}
+
+function updateToolState(){
+  const setup = state.phase==='setup' && !state.over;
+  document.getElementById('addProgSel').disabled = !setup;
+  document.getElementById('addProgBtn').disabled = !setup;
+  const canEnemy = !state.over;
+  document.getElementById('addEnemySel').disabled = !canEnemy;
+  document.getElementById('addEnemyBtn').disabled = !canEnemy;
+}
+
+function start(){
+  state = newState();
+  banner('SETUP · arrange your programs', '#7dd3fc');
+  logEl.innerHTML='';
+  log('sys','Loadout: '+Object.values(state.programs).map(t=>PROGRAMS[t].abbr).join(' ')+' — drag to arrange, then START.');
+  render();
+  updateStartBtn();
+}
+
+function beginCombat(){
+  if(state.phase!=='setup' || state.over) return;
+  banner('','');
+  log('sys','— combat start · programs locked · click an enemy to target —');
+  spawnSignal();
+  // BLIGHT auto-casts its debuff once as combat opens
+  state.enemies.forEach(e=>{ if(e.alive && ENEMY_TYPES[e.type].behavior==='debuff') seedCorruption(e); });
+  render();
+  updateStartBtn();
+}
+
+function updateStartBtn(){
+  document.getElementById('startBtn').style.display = (state.phase==='setup') ? 'inline-block' : 'none';
+}
+start();
+</script>
+</body>
+</html>
