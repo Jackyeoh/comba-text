@@ -59,7 +59,7 @@
   .tile .debbadge { position:absolute; top:2px; left:3px; font-size:10px; color:#e879f9; }
   .tile.burning { background:#2a1206; }
   .tile.burning.prog { border-color:#ea580c; }
-  .tile .burnbadge { position:absolute; top:1px; left:2px; font-size:11px; }
+  .tile .burnbadge { position:absolute; top:1px; left:2px; right:2px; font-size:9px; line-height:1.1; letter-spacing:-1px; word-break:break-all; }
   /* BOMBER telegraph: warning ring (cd 2), intensified pulsing ring (cd 1) */
   .bomb-marker { position:absolute; inset:12px; border:2px solid #ef4444; border-radius:50%; box-shadow:0 0 5px #ef4444; z-index:4; pointer-events:none; opacity:0.75; }
   .bomb-marker::after { content:""; position:absolute; inset:5px; border:2px solid #ef4444; border-radius:50%; }
@@ -222,7 +222,7 @@ const PROGRAMS = {
   empower: { abbr:'EMP', name:'EMPOWER', desc:'on arm: +30% base dmg to adjacent programs (this signal)' },
 };
 const STRIKE_DMG = 10, GUARD_BLOCK = 5, COMBO_GAIN = 3, DELAY_CD = 2;
-const CSTRIKE_BASE = 8, CSTRIKE_RAMP = 3, EMPOWER_PCT = 0.30, DEBUFF_PCT = 0.20, BURN_DMG = 1;
+const CSTRIKE_BASE = 8, CSTRIKE_RAMP = 3, EMPOWER_PCT = 0.30, DEBUFF_PCT = 0.20, BURN_DMG = 3;
 const BOMB_HIT = 30, BOMB_MISS = 10;
 const PROGRAM_COUNT = 7;         // total programs placed (incl. 1 strike + 1 guard)
 const CHAIN_STEP_MS = 260;
@@ -287,7 +287,7 @@ function newState(){
     path: [],            // [{r,c}] visited in order (arm sequence source)
     walls: new Set(),    // edge keys the signal cannot cross (see edgeKey)
     corrupt: new Set(),  // tileKey debuffed by BLIGHT (-20% power); spreads each move
-    burn: new Set(),     // tileKey set alight by EMBER (1 dmg on step-in)
+    burn: new Map(),     // tileKey -> burn stacks (EMBER); stacks × 1 dmg on step-in
     empower: {},         // tileKey -> empower stacks, reset each signal
     cstrikeCount: 0,     // C-STRIKE activations so far this signal (ramp)
     targetId: null,      // enemy the player's strikes aim at (null = random)
@@ -347,7 +347,7 @@ function tryMove(dr,dc){
   state.combo += 1;                 // each move +1 combo
   const nk = key(nr,nc);
   if(state.corrupt.delete(nk)) log('sys','◇ cleansed corruption @'+nk);  // moving in removes it
-  if(state.burn.has(nk)) dealToPlayer(BURN_DMG, 'BURN @'+nk);            // burning tile bites on step-in
+  if(state.burn.has(nk)){ const st=state.burn.get(nk); dealToPlayer(BURN_DMG*st, 'BURN ×'+st+' @'+nk); }  // stacks bite on step-in
   armTile(nk);                      // on-arm hooks fire as the signal passes through
   enemyTick();                      // moving advances enemy cooldowns
   render();
@@ -396,10 +396,11 @@ function signalKey(){ return state.signal ? key(state.signal.r, state.signal.c) 
 function tickEnemyCd(e){
   const t = ENEMY_TYPES[e.type];
   e.cd -= 1;
-  // BOMBER telegraph: lock the target on 'you' two ticks out
-  if(t.behavior==='bomb' && e.cd===2 && !e.bombTarget){
-    e.bombTarget = signalKey();
-    log('dly', e.name+' → arming bomb @'+(e.bombTarget||'?'));
+  // BOMBER telegraph: the marker FOLLOWS you while charging (cd 2 then 1). It does not
+  // update on the detonation tick, so a move made on that turn drops you off the mark.
+  if(t.behavior==='bomb'){
+    if(e.cd===2){ e.bombTarget = signalKey(); log('dly', e.name+' → bomb locking on you'); }
+    else if(e.cd===1){ e.bombTarget = signalKey(); }
   }
   if(e.cd<=0){
     fireAbility(e);
@@ -464,14 +465,16 @@ function seedCorruption(e){
   log('dly',e.name+' → corrupted @'+k);
 }
 
-// EMBER: set a random modifier-free tile alight (1 dmg when the signal steps in).
+// EMBER: set alight a random tile that isn't corrupted — free tiles ignite, already
+// burning tiles gain another stack (each stack = +1 dmg on step-in).
 function burnTile(e){
-  const free=[];
-  for(let r=0;r<GRID;r++) for(let c=0;c<GRID;c++){ const k=key(r,c); if(!tileHasMod(k)) free.push(k); }
-  if(!free.length) return;
-  const k = free[rand(free.length)];
-  state.burn.add(k);
-  log('dly',e.name+' → burning @'+k);
+  const cand=[];
+  for(let r=0;r<GRID;r++) for(let c=0;c<GRID;c++){ const k=key(r,c); if(!state.corrupt.has(k)) cand.push(k); }
+  if(!cand.length) return;
+  const k = cand[rand(cand.length)];
+  const stacks = (state.burn.get(k)||0) + 1;
+  state.burn.set(k, stacks);
+  log('dly',e.name+' → burning @'+k+' ('+stacks+' stack'+(stacks>1?'s':'')+')');
 }
 
 // Each move the corruption expands to one random modifier-free tile adjacent to it.
@@ -609,6 +612,7 @@ function endChain(){
 // Roll a fresh wave of WAVE_SIZE enemies (dead ones stay in the roster, greyed).
 function startWave(n){
   state.wave = n;
+  state.player.block = 0;            // block does not carry between waves
   for(let i=0;i<WAVE_SIZE;i++) state.enemies.push(makeEnemy(rollType(), state.nextEnemyId++));
   state.targetId = null;
   // new BLIGHTs auto-cast on wave entry (older waves are already dead)
@@ -694,7 +698,7 @@ function render(keepFiring){
       t.style.setProperty('--path-alpha', (0.10 + 0.42*pathAlpha[k]).toFixed(3));
     }
     if(state.corrupt.has(k)){ t.classList.add('corrupt'); if(type) t.innerHTML+='<span class="debbadge">-20%</span>'; }
-    if(state.burn.has(k)){ t.classList.add('burning'); t.innerHTML+='<span class="burnbadge">🔥</span>'; }
+    if(state.burn.has(k)){ t.classList.add('burning'); t.innerHTML+='<span class="burnbadge">'+'🔥'.repeat(state.burn.get(k))+'</span>'; }
     if(k in bombMark){ t.insertAdjacentHTML('beforeend','<div class="bomb-marker'+(bombMark[k]?' intense':'')+'"></div>'); }
     if(state.signal && state.signal.r===r && state.signal.c===c && state.phase==='moving'){
       t.classList.add('signal'); t.innerHTML+='<div class="dot"></div>';
@@ -718,15 +722,16 @@ function render(keepFiring){
   enemiesEl.innerHTML='';
   const targeted = selectedTarget();
   state.enemies.forEach(e=>{
+    if(!e.alive) return;                 // dead enemies are cleared from the display
     const d=document.createElement('div');
     const isTarget = targeted && targeted.id===e.id;
-    const ready = e.alive && e.cd<=1;
-    d.className='enemy'+(e.alive?'':' dead')+(isTarget?' targeted':'')+(ready?' imminent':'');
-    d.innerHTML='<div class="name">'+(isTarget?'▸ ':'')+e.name+(e.alive?'':' ✕')+'</div>'+
+    const ready = e.cd<=1;
+    d.className='enemy'+(isTarget?' targeted':'')+(ready?' imminent':'');
+    d.innerHTML='<div class="name">'+(isTarget?'▸ ':'')+e.name+'</div>'+
       '<div class="hp-bar"><div class="hp-fill enemy" style="width:'+(100*e.hp/e.maxHp)+'%"></div></div>'+
       '<div>'+e.hp+' / '+e.maxHp+'</div>'+
-      (e.alive?'<div class="cd'+(ready?' ready':'')+'">'+abilityText(e)+' · cd '+Math.max(0,e.cd)+'</div>':'');
-    if(e.alive){ d.style.cursor='pointer'; d.addEventListener('click', ()=>setTarget(e.id)); }
+      '<div class="cd'+(ready?' ready':'')+'">'+abilityText(e)+' · cd '+Math.max(0,e.cd)+'</div>';
+    d.style.cursor='pointer'; d.addEventListener('click', ()=>setTarget(e.id));
     enemiesEl.appendChild(d);
   });
   updateToolState();
