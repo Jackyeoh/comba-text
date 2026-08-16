@@ -149,7 +149,7 @@
 </head>
 <body>
   <h1>SIGNAL TRACE // combat prototype</h1>
-  <div class="sub">Steer the signal across programs to arm them, then <b>SPACE</b> to trace back and fire the chain.</div>
+  <div class="sub">Steer the signal across programs — each one fires the moment you step on it, at your current combo. Take a hit and the combo is gone.</div>
 
   <div class="banner" id="banner"></div>
 
@@ -181,8 +181,9 @@
           <h2>Controls</h2>
           <div class="keys">
             <b>Setup:</b> drag a program onto an empty tile to move it, or onto another to swap — then START.<br>
-            <b>Combat:</b> Arrows / WASD move signal &nbsp;·&nbsp; <b>Space</b> fire chain &nbsp;·&nbsp; <b>click an enemy</b> to target it. Layout is locked.<br>
-            Each move = +1 combo (+10% signal strength). Moving decrements enemy cooldowns. Orange bars are walls.
+            <b>Combat:</b> Arrows / WASD move signal &nbsp;·&nbsp; <b>click an enemy</b> to target it. Layout is locked.<br>
+            Each move = +1 combo (+10% signal strength) and fires the tile you land on. Moving decrements enemy cooldowns. Orange bars are walls.<br>
+            <b>Any damage that gets through resets your combo</b> — blocked damage does not, so GUARD protects the streak as well as the health.
           </div>
           <button id="startBtn">▶ Start combat</button>
           <button id="reset">Reset run</button>
@@ -213,29 +214,95 @@
 <script>
 // ---------- Config ----------
 const GRID = 5;
-const PROGRAMS = {
-  strike:  { abbr:'STR', name:'STRIKE',  desc:'deal 10 dmg' },
-  cstrike: { abbr:'CST', name:'C-STRIKE',desc:'deal 8 dmg, +3 per C-STRIKE this signal' },
-  guard:   { abbr:'GRD', name:'GUARD',   desc:'gain 5 block' },
-  combo:   { abbr:'CMB', name:'COMBO',   desc:'on arm: +3 combo' },
-  delay:   { abbr:'DLY', name:'DELAY',   desc:'on arm: +2 cd to a random enemy ability' },
-  empower: { abbr:'EMP', name:'EMPOWER', desc:'on arm: +30% base dmg to adjacent programs (this signal)' },
-};
 const STRIKE_DMG = 10, GUARD_BLOCK = 5, COMBO_GAIN = 3, DELAY_CD = 2;
 const CSTRIKE_BASE = 8, CSTRIKE_RAMP = 3, EMPOWER_PCT = 0.30, DEBUFF_PCT = 0.20, BURN_DMG = 3;
 const BOMB_HIT = 30, BOMB_MISS = 10;
+const TRAIL_MAX = 8;             // how many steps of tail the board shows behind the signal
 const PROGRAM_COUNT = 7;         // total programs placed (incl. 1 strike + 1 guard)
-const CHAIN_STEP_MS = 260;
 
-// Enemy roster for the stage — one of each type.
-const ENEMY_TYPES = {
-  gnat:   { name:'GNAT',   hp:45,       cd:1,  behavior:'damage', dmg:2 },
-  daemon: { name:'DAEMON', hp:70,       cd:5,  behavior:'damage', dmg:6 },  // the original enemy
-  warden: { name:'WARDEN', hp:80, cd:6,  behavior:'wall' },
-  siege:  { name:'SIEGE',  hp:80, cd:12, behavior:'ramp',   dmg:8 },
-  blight: { name:'BLIGHT', hp:60, cd:8,  behavior:'debuff' },  // corrupts a tile; spreads each move
-  ember:  { name:'EMBER',  hp:60, cd:4,  behavior:'burn' },    // burns a tile; 1 dmg on step-in
-  bomber: { name:'BOMBER', hp:35, cd:7,  behavior:'bomb' },    // telegraphed bomb: 30 on you, 10 if you flee
+// ---------- Program registry ----------
+// A program is presentation (abbr/name/desc; the KEY doubles as its CSS class) plus
+// `resolve(api, k)`, where `k` is the tile key and `api` (PROGRAM_API) is the only
+// surface it may touch — the prototype stand-in for core's BaseProgram + SignalEngine.
+// Adding a program is one entry here; no engine edits.
+//
+// EVERY program fires the instant the signal steps onto it, at whatever the combo
+// multiplier is worth right then. There is no arm/trace split any more: the player's
+// decision is which tile to step on next, and the answer pays out immediately.
+const PROGRAMS = {
+  strike:  { abbr:'STR', name:'STRIKE',   desc:'deal 10 dmg',
+             resolve:(api,k)=> api.dealDamage(STRIKE_DMG, 'STRIKE', k) },
+  cstrike: { abbr:'CST', name:'C-STRIKE', desc:'deal 8 dmg, +3 per C-STRIKE since your last hit',
+             resolve:(api,k)=>{ const base = api.cstrikeRamp(); api.dealDamage(base, 'C-STRIKE(base '+base+')', k); } },
+  guard:   { abbr:'GRD', name:'GUARD',    desc:'gain 5 block',
+             resolve:(api,k)=> api.addBlock(GUARD_BLOCK, 'GUARD', k) },
+  combo:   { abbr:'CMB', name:'COMBO',    desc:'+3 combo',
+             resolve:(api,k)=> api.addCombo(COMBO_GAIN) },
+  delay:   { abbr:'DLY', name:'DELAY',    desc:'+2 cd to a random enemy ability',
+             resolve:(api,k)=> api.delayRandomAbility() },
+  empower: { abbr:'EMP', name:'EMPOWER',  desc:'+30% base dmg to adjacent programs (until you are hit)',
+             resolve:(api,k)=> api.empowerNeighbors(k) },
+};
+
+// ---------- Enemy ability registry ----------
+// An enemy is stats + a list of ABILITY INSTANCES, each with its own cooldown and
+// runtime state. A behavior is a pluggable unit in ABILITIES; it never touches game
+// state directly — it goes through the injected `api` surface (ENEMY_API). This is
+// the shape the core port will use (BaseEnemy + abilities/types + a sink/engine API).
+//
+// Ability hooks (all optional except fire/label), called as (api, enemy, inst):
+//   label(enemy, inst)   -> string shown on the enemy card
+//   fire(api, enemy, inst)   -> resolves when inst.cd hits 0
+//   onCd(api, enemy, inst)   -> every cooldown tick, after decrement, before fire
+//   onMove(api, enemy, inst) -> once per PLAYER MOVE (not on the post-chain tick)
+//   onStruck(api, enemy, inst) -> when this enemy takes strike damage
+//   onEnter(api, enemy, inst)  -> when the enemy enters play (combat/wave start, spawn)
+//   telegraph(enemy, inst)     -> { tile, intense } board marker, or null
+const ABILITIES = {
+  strike: {
+    label: (e,i) => 'attack ' + i.dmg,
+    fire:  (api,e,i) => api.damagePlayer(i.dmg, e.name),
+  },
+  ramp: {
+    label:    (e,i) => 'attack ' + (i.dmg + i.sinceAttacked) + ' (ramps +1/move)',
+    onMove:   (api,e,i) => { i.sinceAttacked += 1; },     // grows while un-struck
+    onStruck: (api,e,i) => { i.sinceAttacked = 0; },      // striking it resets the ramp
+    fire:     (api,e,i) => api.damagePlayer(i.dmg + i.sinceAttacked, e.name + ' (ramp ' + i.sinceAttacked + ')'),
+  },
+  wall: {
+    label: () => 'raise wall',
+    fire:  (api,e,i) => api.raiseWall(e),
+  },
+  corrupt: {
+    label:   () => 'corrupt (spreads/move)',
+    onEnter: (api,e,i) => api.seedCorruption(e),          // auto-casts once on entry
+    fire:    (api,e,i) => api.seedCorruption(e),
+  },
+  burn: {
+    label: () => 'burn a tile',
+    fire:  (api,e,i) => api.burnTile(e),
+  },
+  bomb: {
+    label: () => 'bomb ' + BOMB_HIT + ' / ' + BOMB_MISS + ' if fled',
+    // marker FOLLOWS you while charging (cd 2 then 1); not updated on the detonation tick
+    onCd: (api,e,i) => {
+      if(i.cd === 2){ i.bombTarget = api.signalKey(); api.log(e.name + ' → bomb locking on you'); }
+      else if(i.cd === 1){ i.bombTarget = api.signalKey(); }
+    },
+    fire:      (api,e,i) => api.detonateBomb(e, i),
+    telegraph: (e,i) => (i.bombTarget && i.cd <= 2) ? { tile: i.bombTarget, intense: i.cd <= 1 } : null,
+  },
+};
+
+// Enemy roster — stats + which ability instances the enemy fields.
+const ENEMY_DEFS = {
+  gnat:   { name:'GNAT',   hp:45, abilities:[{ kind:'strike',  cd:1,  dmg:2 }] },
+  daemon: { name:'DAEMON', hp:70, abilities:[{ kind:'strike',  cd:5,  dmg:6 }] },  // the original enemy
+  warden: { name:'WARDEN', hp:80, abilities:[{ kind:'wall',    cd:6 }] },
+  siege:  { name:'SIEGE',  hp:80, abilities:[{ kind:'ramp',    cd:12, dmg:8 }] },
+  blight: { name:'BLIGHT', hp:60, abilities:[{ kind:'corrupt', cd:8 }] },
+  ember:  { name:'EMBER',  hp:60, abilities:[{ kind:'burn',    cd:4 }] },
+  bomber: { name:'BOMBER', hp:35, abilities:[{ kind:'bomb',    cd:7 }] },
 };
 const WAVE_COUNT = 3, WAVE_SIZE = 3;   // 3 waves of 3 enemies rolled from the roster
 
@@ -245,16 +312,35 @@ let state;
 function rand(n){ return Math.floor(Math.random()*n); }
 function key(r,c){ return r+','+c; }
 
-function rollType(){ const r = Object.keys(ENEMY_TYPES); return r[rand(r.length)]; }
-function makeEnemy(typeKey, id){
-  const t = ENEMY_TYPES[typeKey];
-  return {
-    id, type: typeKey, name: t.name,
-    hp: t.hp, maxHp: t.hp, alive: true,
-    cd: Math.max(1, t.cd - rand(3)),   // 0-2 cd advancement, min 1
-    sinceAttacked: 0,                  // moves since last struck (SIEGE ramp)
-    bombTarget: null,                  // BOMBER: locked tile once telegraphed
-  };
+function rollType(){ const r = Object.keys(ENEMY_DEFS); return r[rand(r.length)]; }
+function makeEnemy(defKey, id){
+  const def = ENEMY_DEFS[defKey];
+  const abilities = def.abilities.map(a => ({
+    kind: a.kind,
+    cdMax: a.cd,
+    cd: Math.max(1, a.cd - rand(3)),   // 0-2 cd advancement, min 1
+    dmg: a.dmg,                        // strike/ramp
+    sinceAttacked: 0,                  // ramp
+    bombTarget: null,                  // bomb
+  }));
+  return { id, defKey, name: def.name, hp: def.hp, maxHp: def.hp, alive: true, abilities };
+}
+
+// The surface abilities are allowed to touch — the prototype's stand-in for the core
+// SignalEngine sink/API. Keeping abilities behind this makes the port mechanical.
+const ENEMY_API = {
+  signalKey:      () => signalKey(),
+  log:            (m) => log('dly', m),
+  damagePlayer:   (amt, src) => dealToPlayer(amt, src),
+  seedCorruption: (e) => seedCorruption(e),
+  burnTile:       (e) => burnTile(e),
+  raiseWall:      (e) => placeWall(e),
+  detonateBomb:   (e, i) => detonateBomb(e, i),
+};
+
+// Run an enemy's on-entry ability hooks (combat start, wave start, dropdown spawn).
+function enemyEnter(e){
+  e.abilities.forEach(i => { const ab = ABILITIES[i.kind]; if(ab.onEnter) ab.onEnter(ENEMY_API, e, i); });
 }
 
 function newState(){
@@ -288,10 +374,10 @@ function newState(){
     walls: new Set(),    // edge keys the signal cannot cross (see edgeKey)
     corrupt: new Set(),  // tileKey debuffed by BLIGHT (-20% power); spreads each move
     burn: new Map(),     // tileKey -> burn stacks (EMBER); stacks × 1 dmg on step-in
-    empower: {},         // tileKey -> empower stacks, reset each signal
-    cstrikeCount: 0,     // C-STRIKE activations so far this signal (ramp)
+    empower: {},         // tileKey -> empower stacks, cleared when you take a hit
+    cstrikeCount: 0,     // C-STRIKE activations since the last hit taken (ramp)
     targetId: null,      // enemy the player's strikes aim at (null = random)
-    phase: 'setup',      // setup | moving | activating | over
+    phase: 'setup',      // setup | moving | over
     over: false,
   };
 }
@@ -319,22 +405,35 @@ function setTarget(id){
 // ---------- Signal spawn ----------
 function programTiles(){ return Object.keys(state.programs); }
 
+// The signal is spawned ONCE, at combat start, and then simply keeps going — there is
+// no chain to end it and no respawn. What used to be the per-signal boundary (combo,
+// empower stacks, the C-STRIKE ramp) is now cleared by TAKING A HIT instead; see
+// resetMomentum.
 function spawnSignal(){
   const tiles = programTiles();
   const k = tiles[rand(tiles.length)];
   const [r,c] = k.split(',').map(Number);
   state.signal = { r, c };
-  state.path = [{ r, c }];   // spawn tile is first armed step
-  state.combo = 0;
-  state.empower = {};        // per-signal buffs reset
-  state.cstrikeCount = 0;
+  state.path = [{ r, c }];
+  resetMomentum();
   state.phase = 'moving';
-  log('sys','— signal spawned on '+PROGRAMS[state.programs[k]].name+' —');
-  armTile(k);   // spawn tile counts as armed
-  render();
+  log('sys','— signal live on '+PROGRAMS[state.programs[k]].name+' —');
+  activateTile(k);   // the tile it lands on fires like any other
+  render(true);
+}
+
+// Everything the player builds up by moving without being hit. Cleared together,
+// because they are one resource: momentum. Losing it is what a hit COSTS.
+function resetMomentum(){
+  state.combo = 0;
+  state.empower = {};
+  state.cstrikeCount = 0;
 }
 
 // ---------- Movement ----------
+// One move is the whole turn: step, the tile you land on FIRES immediately at the combo
+// you have built, then the enemies advance. There is no separate commit — the question
+// is only ever "which tile next?", and it is answered on the spot.
 function tryMove(dr,dc){
   if(state.phase!=='moving' || state.over) return;
   const nr = state.signal.r + dr, nc = state.signal.c + dc;
@@ -344,13 +443,17 @@ function tryMove(dr,dc){
   }
   state.signal = { r:nr, c:nc };
   state.path.push({ r:nr, c:nc });
+  if(state.path.length > TRAIL_MAX) state.path.shift();   // the trail is a tail, not a record
   state.combo += 1;                 // each move +1 combo
   const nk = key(nr,nc);
   if(state.corrupt.delete(nk)) log('sys','◇ cleansed corruption @'+nk);  // moving in removes it
-  if(state.burn.has(nk)){ const st=state.burn.get(nk); dealToPlayer(BURN_DMG*st, 'BURN ×'+st+' @'+nk); }  // stacks bite on step-in
-  armTile(nk);                      // on-arm hooks fire as the signal passes through
+  // Burn bites BEFORE the tile pays out, so stepping into fire costs you the multiplier
+  // you were about to spend — the hazard and the combo reset are the same beat.
+  if(state.burn.has(nk)){ const st=state.burn.get(nk); dealToPlayer(BURN_DMG*st, 'BURN ×'+st+' @'+nk); }
+  activateTile(nk);                 // the tile fires now, at the current multiplier
   enemyTick();                      // moving advances enemy cooldowns
-  render();
+  checkWaveCleared();               // a step can finish the wave outright
+  render(true);
 }
 
 // Edge id between two adjacent cells: top-left cell + 'R' (right) or 'D' (down).
@@ -359,97 +462,85 @@ function edgeKey(a,b){
   return Math.min(a.r,b.r)+','+a.c+':D';
 }
 
-// On-arm hooks fire the moment the signal enters a program tile (repeats each pass).
-// STRIKE/GUARD do nothing here and resolve in the trace-back chain; COMBO & DELAY
-// resolve on arm instead.
-function armTile(k){
-  const type = state.programs[k];
-  if(type==='delay') doDelay();
-  else if(type==='combo'){
-    state.combo += COMBO_GAIN;
-    log('cmb','COMBO (armed) → +'+COMBO_GAIN+' combo (now '+state.combo+')');
-  }
-  else if(type==='empower') doEmpower(k);
+// Fire whatever program is on this tile, right now, at the current combo multiplier.
+// Every program takes this one path — the arm/trace split is gone.
+function activateTile(k){
+  const p = PROGRAMS[state.programs[k]];
+  if(!p) { firingCell = null; return; }
+  firingCell = k;                 // highlight the tile that just paid out
+  p.resolve(PROGRAM_API, k);
 }
 
-// EMPOWER buffs its 4 orthogonal neighbours (+30% base dmg) for this signal.
-function doEmpower(k){
-  const [r,c] = k.split(',').map(Number);
-  let n=0;
-  [[-1,0],[1,0],[0,-1],[0,1]].forEach(([dr,dc])=>{
-    const nk = key(r+dr, c+dc);
-    if(state.programs[nk]){ state.empower[nk] = (state.empower[nk]||0) + 1; n++; }
-  });
-  log('cmb','EMPOWER (armed) → +'+Math.round(EMPOWER_PCT*100)+'% base dmg to '+n+' neighbour(s)');
-}
-
-function doDelay(){
-  const alive = state.enemies.filter(e=>e.alive);
-  if(!alive.length) return;
-  const e = alive[rand(alive.length)];
-  e.cd += DELAY_CD;
-  log('dly','DELAY (armed) → '+e.name+' cooldown +'+DELAY_CD+' (now '+e.cd+')');
-}
+// The surface programs may touch — the prototype stand-in for core's SignalEngine sink.
+// Damage folds empower (per-tile, ×) × corruption (−20% on tile) × combo strength.
+const PROGRAM_API = {
+  dealDamage(base, label, k){
+    const emp = 1 + EMPOWER_PCT * (state.empower[k] || 0);
+    const deb = state.corrupt.has(k) ? (1 - DEBUFF_PCT) : 1;
+    dealStrike(base * emp * deb * strengthMult(), label, emp, deb);
+  },
+  addBlock(base, label, k){
+    const deb = state.corrupt.has(k) ? (1 - DEBUFF_PCT) : 1;
+    const blk = Math.round(base * deb * strengthMult());
+    state.player.block += blk;
+    log('blk', label + ' → +' + blk + ' block (' + Math.round(strengthMult()*100) + '%' + (deb<1?' ·-20%':'') + ')');
+  },
+  addCombo(n){
+    state.combo += n;
+    log('cmb','COMBO (armed) → +' + n + ' combo (now ' + state.combo + ')');
+  },
+  cstrikeRamp(){
+    const base = CSTRIKE_BASE + CSTRIKE_RAMP * state.cstrikeCount;   // ramps until you are hit
+    state.cstrikeCount++;
+    return base;
+  },
+  empowerNeighbors(k){
+    const [r,c] = k.split(',').map(Number);
+    let n=0;
+    [[-1,0],[1,0],[0,-1],[0,1]].forEach(([dr,dc])=>{
+      const nk = key(r+dr, c+dc);
+      if(state.programs[nk]){ state.empower[nk] = (state.empower[nk]||0) + 1; n++; }
+    });
+    log('cmb','EMPOWER (armed) → +' + Math.round(EMPOWER_PCT*100) + '% base dmg to ' + n + ' neighbour(s)');
+  },
+  delayRandomAbility(){
+    const alive = state.enemies.filter(e=>e.alive);
+    if(!alive.length) return;
+    const e = alive[rand(alive.length)];
+    const inst = e.abilities[rand(e.abilities.length)];   // random ability of a random enemy
+    inst.cd += DELAY_CD;
+    log('dly','DELAY (armed) → ' + e.name + ' ' + inst.kind + ' cooldown +' + DELAY_CD + ' (now ' + inst.cd + ')');
+  },
+};
 
 function signalKey(){ return state.signal ? key(state.signal.r, state.signal.c) : null; }
 
-function tickEnemyCd(e){
-  const t = ENEMY_TYPES[e.type];
-  e.cd -= 1;
-  // BOMBER telegraph: the marker FOLLOWS you while charging (cd 2 then 1). It does not
-  // update on the detonation tick, so a move made on that turn drops you off the mark.
-  if(t.behavior==='bomb'){
-    if(e.cd===2){ e.bombTarget = signalKey(); log('dly', e.name+' → bomb locking on you'); }
-    else if(e.cd===1){ e.bombTarget = signalKey(); }
-  }
-  if(e.cd<=0){
-    fireAbility(e);
-    e.cd = t.cd;
+// Advance one ability instance by a tick. `isMove` = a real player move (drives onMove
+// passives like the ramp) vs the free post-chain tick.
+function tickAbility(e, inst, isMove){
+  const ab = ABILITIES[inst.kind];
+  if(isMove && ab.onMove) ab.onMove(ENEMY_API, e, inst);
+  inst.cd -= 1;
+  if(ab.onCd) ab.onCd(ENEMY_API, e, inst);
+  if(inst.cd <= 0){
+    ab.fire(ENEMY_API, e, inst);
+    inst.cd = inst.cdMax;
   }
 }
 
 function enemyTick(){
-  state.enemies.forEach(e=>{
-    if(!e.alive) return;
-    e.sinceAttacked += 1;             // each player move without being struck
-    tickEnemyCd(e);
-  });
-  spreadCorruption();                 // BLIGHT corruption grows one tile per move
+  state.enemies.forEach(e=>{ if(e.alive) e.abilities.forEach(i => tickAbility(e, i, true)); });
+  spreadCorruption();                 // board-level: corruption grows one tile per move
   checkPlayerDead();
-}
-
-// After a firing chain resolves, advance cooldowns by 1 (abilities may fire) so the
-// chain isn't "free". Not a move: no ramp increment, no corruption spread.
-function advanceCooldowns(){
-  state.enemies.forEach(e=>{ if(e.alive) tickEnemyCd(e); });
-  checkPlayerDead();
-}
-
-function fireAbility(e){
-  const t = ENEMY_TYPES[e.type];
-  if(t.behavior==='damage'){
-    dealToPlayer(t.dmg, e.name);
-  } else if(t.behavior==='ramp'){
-    const dmg = t.dmg + e.sinceAttacked;   // +1 per move it hasn't been attacked
-    dealToPlayer(dmg, e.name+' (ramp '+e.sinceAttacked+')');
-  } else if(t.behavior==='wall'){
-    placeWall(e);
-  } else if(t.behavior==='debuff'){
-    seedCorruption(e);
-  } else if(t.behavior==='burn'){
-    burnTile(e);
-  } else if(t.behavior==='bomb'){
-    detonateBomb(e);
-  }
 }
 
 // BOMBER: 30 dmg if the signal is on the telegraphed tile, else 10.
-function detonateBomb(e){
-  const target = e.bombTarget || signalKey();
+function detonateBomb(e, inst){
+  const target = inst.bombTarget || signalKey();
   const direct = target!=null && signalKey()===target;
   const dmg = direct ? BOMB_HIT : BOMB_MISS;
   dealToPlayer(dmg, e.name+(direct?' — DIRECT HIT':' — near miss')+' @'+target);
-  e.bombTarget = null;
+  inst.bombTarget = null;
 }
 
 // A tile can hold at most one modifier (corruption OR burn).
@@ -480,7 +571,7 @@ function burnTile(e){
 // Each move the corruption expands to one random modifier-free tile adjacent to it.
 function spreadCorruption(){
   if(!state.corrupt.size) return;
-  if(!state.enemies.some(e=>e.alive && ENEMY_TYPES[e.type].behavior==='debuff')) return;
+  if(!state.enemies.some(e=>e.alive && e.abilities.some(a=>a.kind==='corrupt'))) return;
   const frontier = new Set();
   state.corrupt.forEach(k=>{
     const [r,c] = k.split(',').map(Number);
@@ -523,6 +614,15 @@ function dealToPlayer(amt, src){
     log('dmg', src+' hits for '+amt);
   }
   state.player.hp -= dmg;
+  // A hit that actually LANDS wipes the momentum you were spending. Damage stopped by
+  // block does not — block is what buys you the right to keep your combo, which is the
+  // whole reason to spend steps on GUARD instead of on another weapon.
+  if(dmg > 0 && state.combo > 0){
+    log('cmb','✕ hit — combo reset (was '+state.combo+')');
+    resetMomentum();
+  } else if(dmg > 0){
+    resetMomentum();
+  }
 }
 
 function checkPlayerDead(){
@@ -534,44 +634,18 @@ function checkPlayerDead(){
   }
 }
 
-// ---------- Activation chain ----------
-function fireChain(){
-  if(state.phase!=='moving' || state.over) return;
-  state.phase='activating';
-  const reversed = state.path.slice().reverse(); // trace backward
-  log('sys','▶ tracing back '+reversed.length+' steps…');
-  let i=0;
-  const step = ()=>{
-    if(state.over){ return; }
-    if(i>=reversed.length){ endChain(); return; }
-    const {r,c} = reversed[i];
-    highlightFiring(r,c);
-    const k = key(r,c);
-    const type = state.programs[k];
-    if(type) activate(type, k);
-    i++;
-    render(true);
-    setTimeout(step, CHAIN_STEP_MS);
-  };
-  step();
-}
-
-function activate(type, k){
-  const s = strengthMult();
-  const emp = 1 + EMPOWER_PCT * (state.empower[k] || 0);   // empower is multiplicative w/ combo
-  const deb = state.corrupt.has(k) ? (1 - DEBUFF_PCT) : 1; // BLIGHT corruption on this tile
-  if(type==='strike'){
-    dealStrike(STRIKE_DMG * emp * deb * s, 'STRIKE', emp, deb);
-  } else if(type==='cstrike'){
-    const base = CSTRIKE_BASE + CSTRIKE_RAMP * state.cstrikeCount;   // ramps within the signal
-    state.cstrikeCount++;
-    dealStrike(base * emp * deb * s, 'C-STRIKE(base '+base+')', emp, deb);
-  } else if(type==='guard'){
-    const blk = Math.round(GUARD_BLOCK * deb * s);
-    state.player.block += blk;
-    log('blk','GUARD → +'+blk+' block ('+Math.round(s*100)+'%'+(deb<1?' ·-20%':'')+')');
+// ---------- Wave / victory ----------
+// Checked after every move, since a step is now the only thing that can end a wave.
+function checkWaveCleared(){
+  if(state.over) return;
+  if(!state.enemies.every(e=>!e.alive)) return;
+  if(state.wave < state.maxWaves){
+    startWave(state.wave + 1);
+    return;
   }
-  // 'combo' / 'delay' / 'empower' resolve on-arm (see armTile), not in the trace-back chain
+  state.over=true; state.phase='over';
+  banner('✓ ALL WAVES CLEARED', '#22c55e');
+  log('win','You win!');
 }
 
 function dealStrike(raw, label, emp, deb){
@@ -579,34 +653,10 @@ function dealStrike(raw, label, emp, deb){
   const target = strikeTarget();
   if(!target) return;
   target.hp -= dmg;
-  target.sinceAttacked = 0;          // resets SIEGE ramp
+  target.abilities.forEach(i => { const ab = ABILITIES[i.kind]; if(ab.onStruck) ab.onStruck(ENEMY_API, target, i); });  // e.g. resets SIEGE ramp
   const tags = Math.round(strengthMult()*100)+'%'+(emp>1?' ·emp '+Math.round(emp*100)+'%':'')+(deb<1?' ·-20%':'');
   log('dmg', label+' → '+target.name+' for '+dmg+' ('+tags+')');
   if(target.hp<=0){ target.hp=0; target.alive=false; log('sys',target.name+' destroyed'); state.targetId=null; }
-}
-
-function endChain(){
-  clearFiring();
-  // wave clear check
-  if(state.enemies.every(e=>!e.alive)){
-    if(state.wave < state.maxWaves){
-      startWave(state.wave + 1);       // advance to the next wave, keep playing
-      spawnSignal();
-      return;
-    }
-    state.over=true; state.phase='over';
-    banner('✓ ALL WAVES CLEARED', '#22c55e');
-    log('win','You win!');
-    render();
-    return;
-  }
-  if(state.over){ render(); return; }
-  // firing the chain isn't free: tick cooldowns once (may trigger enemy abilities)
-  log('sys','chain resolved · cooldowns advance 1');
-  advanceCooldowns();
-  if(state.over){ render(); return; }   // player may have died to a triggered ability
-  // spawn next signal
-  spawnSignal();
 }
 
 // Roll a fresh wave of WAVE_SIZE enemies (dead ones stay in the roster, greyed).
@@ -616,7 +666,9 @@ function startWave(n){
   for(let i=0;i<WAVE_SIZE;i++) state.enemies.push(makeEnemy(rollType(), state.nextEnemyId++));
   state.targetId = null;
   // new BLIGHTs auto-cast on wave entry (older waves are already dead)
-  state.enemies.forEach(e=>{ if(e.alive && ENEMY_TYPES[e.type].behavior==='debuff') seedCorruption(e); });
+  state.enemies.forEach(e=>{ if(e.alive) enemyEnter(e); });   // new wave enters play (older waves are dead)
+  // The signal is not respawned between waves — it is the same live signal, and the
+  // momentum the player carried in is theirs to keep.
   log('sys','— WAVE '+n+' / '+state.maxWaves+' —');
 }
 
@@ -625,9 +677,8 @@ const boardEl = document.getElementById('board');
 const enemiesEl = document.getElementById('enemies');
 const logEl = document.getElementById('log');
 
+// The tile that fired on the last step, highlighted until the next one.
 let firingCell = null;
-function highlightFiring(r,c){ firingCell = key(r,c); }
-function clearFiring(){ firingCell = null; }
 
 // ---------- Drag to rearrange programs ----------
 // Only during the pre-combat setup phase; locked once combat starts.
@@ -672,13 +723,15 @@ function render(keepFiring){
   const ordered = Object.entries(lastIdx).sort((a,b)=>a[1]-b[1]).map(e=>e[0]);
   const pathAlpha = {};
   ordered.forEach((kk,idx)=>{ pathAlpha[kk] = ordered.length>1 ? idx/(ordered.length-1) : 1; });
-  // BOMBER telegraph markers: warn at cd 2, intensify at cd 1
+  // Board telegraph markers, sourced from each ability's telegraph() hook (BOMBER)
   const bombMark = {};
   state.enemies.forEach(e=>{
-    if(e.alive && ENEMY_TYPES[e.type].behavior==='bomb' && e.bombTarget && e.cd<=2){
-      const intense = e.cd<=1;
-      if(intense || !bombMark[e.bombTarget]) bombMark[e.bombTarget] = intense;
-    }
+    if(!e.alive) return;
+    e.abilities.forEach(i=>{
+      const ab = ABILITIES[i.kind];
+      const tg = ab.telegraph && ab.telegraph(e, i);
+      if(tg && (tg.intense || !bombMark[tg.tile])) bombMark[tg.tile] = tg.intense;
+    });
   });
   for(let r=0;r<GRID;r++) for(let c=0;c<GRID;c++){
     const k = key(r,c);
@@ -725,27 +778,19 @@ function render(keepFiring){
     if(!e.alive) return;                 // dead enemies are cleared from the display
     const d=document.createElement('div');
     const isTarget = targeted && targeted.id===e.id;
-    const ready = e.cd<=1;
+    const ready = e.abilities.some(i=>i.cd<=1);   // any ability about to fire
     d.className='enemy'+(isTarget?' targeted':'')+(ready?' imminent':'');
+    const abLines = e.abilities.map(i=>{
+      const r = i.cd<=1;
+      return '<div class="cd'+(r?' ready':'')+'">'+ABILITIES[i.kind].label(e,i)+' · cd '+Math.max(0,i.cd)+'</div>';
+    }).join('');
     d.innerHTML='<div class="name">'+(isTarget?'▸ ':'')+e.name+'</div>'+
       '<div class="hp-bar"><div class="hp-fill enemy" style="width:'+(100*e.hp/e.maxHp)+'%"></div></div>'+
-      '<div>'+e.hp+' / '+e.maxHp+'</div>'+
-      '<div class="cd'+(ready?' ready':'')+'">'+abilityText(e)+' · cd '+Math.max(0,e.cd)+'</div>';
+      '<div>'+e.hp+' / '+e.maxHp+'</div>'+ abLines;
     d.style.cursor='pointer'; d.addEventListener('click', ()=>setTarget(e.id));
     enemiesEl.appendChild(d);
   });
   updateToolState();
-}
-
-function abilityText(e){
-  const t = ENEMY_TYPES[e.type];
-  if(t.behavior==='damage') return 'attack '+t.dmg;
-  if(t.behavior==='ramp')   return 'attack '+(t.dmg + e.sinceAttacked)+' (ramps +1/move)';
-  if(t.behavior==='wall')   return 'raise wall';
-  if(t.behavior==='debuff') return 'corrupt (spreads/move)';
-  if(t.behavior==='burn')   return 'burn a tile';
-  if(t.behavior==='bomb')   return 'bomb '+BOMB_HIT+' / '+BOMB_MISS+' if fled';
-  return '';
 }
 
 function log(cls,msg){
@@ -762,8 +807,9 @@ window.addEventListener('keydown',(e)=>{
   else if(k==='arrowleft'||k==='a'){ tryMove(0,-1); e.preventDefault(); }
   else if(k==='arrowright'||k==='d'){ tryMove(0,1); e.preventDefault(); }
   else if(k===' '){
-    if(state.phase==='setup') beginCombat(); else fireChain();
-    e.preventDefault();
+    if(state.phase==='setup') beginCombat();   // SPACE only starts the fight now —
+    e.preventDefault();                        // every step commits itself
+
   }
   else if(k==='enter'){ if(state.phase==='setup') beginCombat(); }
 });
@@ -775,7 +821,7 @@ document.getElementById('startBtn').addEventListener('click', beginCombat);
   const p = document.getElementById('addProgSel');
   Object.keys(PROGRAMS).forEach(k=>{ const o=document.createElement('option'); o.value=k; o.textContent=PROGRAMS[k].name; p.appendChild(o); });
   const e = document.getElementById('addEnemySel');
-  Object.keys(ENEMY_TYPES).forEach(k=>{ const o=document.createElement('option'); o.value=k; o.textContent=ENEMY_TYPES[k].name; e.appendChild(o); });
+  Object.keys(ENEMY_DEFS).forEach(k=>{ const o=document.createElement('option'); o.value=k; o.textContent=ENEMY_DEFS[k].name; e.appendChild(o); });
 })();
 document.getElementById('addProgBtn').addEventListener('click', ()=> addProgram(document.getElementById('addProgSel').value));
 document.getElementById('addEnemyBtn').addEventListener('click', ()=> addEnemy(document.getElementById('addEnemySel').value));
@@ -801,8 +847,8 @@ function addEnemy(type){
   if(state.over){ return; }
   const spawned = makeEnemy(type, state.nextEnemyId++);
   state.enemies.push(spawned);
-  // BLIGHT auto-casts once on entry; during setup it waits for combat start
-  if(ENEMY_TYPES[type].behavior==='debuff' && state.phase!=='setup') seedCorruption(spawned);
+  // on-entry hooks fire immediately mid-combat; during setup they wait for combat start
+  if(state.phase!=='setup') enemyEnter(spawned);
   log('sys','spawned '+spawned.name);
   render(true);
 }
@@ -830,8 +876,7 @@ function beginCombat(){
   banner('','');
   log('sys','— combat start · programs locked · click an enemy to target —');
   spawnSignal();
-  // BLIGHT auto-casts its debuff once as combat opens
-  state.enemies.forEach(e=>{ if(e.alive && ENEMY_TYPES[e.type].behavior==='debuff') seedCorruption(e); });
+  state.enemies.forEach(e=>{ if(e.alive) enemyEnter(e); });   // on-entry hooks (e.g. BLIGHT seeds corruption)
   render();
   updateStartBtn();
 }
