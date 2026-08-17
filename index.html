@@ -144,6 +144,7 @@
 
   .stat-row { display:flex; justify-content:space-between; }
   .strength { color:#22d3ee; font-weight: bold; }
+  .escalation { color:#f87171; font-weight: bold; }
 
   .log {
     background:#0e1621; border:1px solid #1f2937; padding:8px;
@@ -210,6 +211,10 @@
           <div class="stat-row">
             <span>Signal strength</span><span class="strength" id="strengthText"></span>
           </div>
+          <div class="stat-row" id="escRow" style="display:none">
+            <span>Enemy power</span><span class="escalation" id="escText"></span>
+          </div>
+          <div class="stat-row"><span>Next escalation in</span><span id="escNextText"></span></div>
         </div>
 
         <div class="panel">
@@ -218,6 +223,7 @@
             <b>Setup:</b> drag a program onto an empty tile to move it, or onto another to swap — then START.<br>
             <b>Combat:</b> Arrows / WASD move signal &nbsp;·&nbsp; <b>click an enemy</b> to target it. Layout is locked.<br>
             Each move = +1 combo (+10% signal strength) and fires the tile you land on. Moving decrements enemy cooldowns. Orange bars are walls.<br>
+            <b>Every 5 moves the enemy gains +20% power</b> — stalling is not a strategy.<br>
             <b>Any damage that gets through resets your combo</b> — blocked damage does not, so GUARD protects the streak as well as the health.<br>
             <b>POWERS</b> below are toggle-able run modifiers; they persist across Reset so two runs can be compared on the same picks.
           </div>
@@ -286,6 +292,10 @@ const CSTRIKE_BASE = 8, CSTRIKE_RAMP = 3, EMPOWER_PCT = 0.30, BURN_DMG = 3;
 const DEBUFF_PER_STACK   = 0.15;   // output reduction per corruption stack
 const CORRUPT_SPREAD_EVERY = 2;    // player moves between one spread and the next
 const CORRUPT_GROW_TURNS   = 2;    // moves between stacks once a tile is fully corrupted
+// Escalation: the fight gets worse the longer it runs, so a stalemate is never a
+// strategy. Counted in PLAYER MOVES, like everything else on the clock.
+const ESCALATE_EVERY = 5;          // moves between escalations
+const ESCALATE_PCT   = 0.20;       // enemy power gained per escalation
 const BOMB_HIT = 30, BOMB_MISS = 10;
 const EMPOWER_MAX = 5;           // stacks one tile can hold — caps the +30%/stack ramp
 const TRAIL_MAX = 8;             // how many steps of tail the board shows behind the signal
@@ -448,7 +458,7 @@ function makeEnemy(defKey, id){
 }
 
 function scaleHp(v){ return Math.max(1, Math.round(v * enemyScale.hp)); }
-function scaleAtk(v){ return v == null ? v : Math.max(1, Math.round(v * enemyScale.atk)); }
+function scaleAtk(v){ return v == null ? v : Math.max(1, Math.round(v * atkMult())); }
 
 /**
  * Re-apply the dials to enemies already on the board, so a slider is felt immediately
@@ -491,7 +501,10 @@ let powerSel = { comboBonus:0, startCombo:0, startGuard:0, comboShield:0, moment
 // outside state, so a reset re-rolls the fight at the SAME difficulty — otherwise the
 // sliders would be useless for comparing two runs.
 let enemyScale = { hp: 1, atk: 1 };
-function atkMult(){ return enemyScale.atk; }
+// Everything that hurts the player is scaled here — ability damage, bombs, burn — so the
+// debug dial and the fight's own escalation compose in ONE place rather than each source
+// remembering to apply both.
+function atkMult(){ return enemyScale.atk * (1 + ESCALATE_PCT * (state?.escalation ?? 0)); }
 
 function newState(){
   // place programs: 1 strike, 1 guard, rest random
@@ -525,6 +538,8 @@ function newState(){
     // tileKey -> { stacks, full, timer } — BLIGHT's rot. See DEBUFF_PER_STACK.
     corrupt: new Map(),
     corruptSpreadTimer: 0,   // moves since the last spread
+    movesTaken: 0,           // successful moves this combat (drives escalation)
+    escalation: 0,           // +ESCALATE_PCT enemy power per stack
     burn: new Map(),     // tileKey -> burn stacks (EMBER); stacks × 1 dmg on step-in
     empower: {},         // tileKey -> empower stacks, cleared when you take a hit
     cstrikeCount: 0,     // C-STRIKE activations since the last hit taken (ramp)
@@ -716,7 +731,19 @@ function enemyTick(){
   state.enemies.forEach(e=>{ if(e.alive) e.abilities.forEach(i => tickAbility(e, i, true)); });
   tickCorruption();                   // rot matures, and spreads every other move
   decayWalls();                       // walls are temporary — they stand for WALL_TURNS moves
+  tickEscalation();                   // the fight itself gets harder the longer it runs
   checkPlayerDead();
+}
+
+// Every ESCALATE_EVERY moves the whole board hits harder. Applied through the same
+// multiplier the ATK dial uses, then pushed onto live enemies so the numbers on their
+// cards move with it — an escalation the player cannot see is just unexplained damage.
+function tickEscalation(){
+  if(++state.movesTaken % ESCALATE_EVERY !== 0) return;
+  state.escalation++;
+  applyEnemyScaling();
+  log('dmg','⚠ ESCALATION ×'+state.escalation+' — enemy power +'
+    + Math.round(ESCALATE_PCT*state.escalation*100)+'%');
 }
 
 // A raised wall stands for a few moves and then collapses, so a severed route is a
@@ -997,6 +1024,15 @@ function render(keepFiring){
   document.getElementById('blockText').textContent = state.player.block>0 ? '🛡 '+state.player.block+' block' : '';
   document.getElementById('comboText').textContent = state.combo;
   document.getElementById('strengthText').textContent = Math.round(strengthMult()*100)+'%';
+  // Escalation: the standing enemy-power bonus, plus the countdown to the next one, so
+  // the ramp is something the player can plan around rather than discover by dying.
+  const escRow = document.getElementById('escRow');
+  escRow.style.display = state.escalation ? 'flex' : 'none';
+  document.getElementById('escText').textContent =
+    '+' + Math.round(ESCALATE_PCT * state.escalation * 100) + '%';
+  document.getElementById('escNextText').textContent =
+    (ESCALATE_EVERY - (state.movesTaken % ESCALATE_EVERY)) + ' moves';
+
   // Floating readout over the board — the same two numbers, where the player is looking.
   const hud = document.getElementById('comboHud');
   document.getElementById('comboN').textContent = state.combo;
