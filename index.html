@@ -83,6 +83,7 @@
   .tile .rot {
     position:absolute; pointer-events:none;
     background:#3b0f42; border:1px solid #a21caf;
+    opacity:.5;                 /* the program underneath has to stay readable */
     transition: inset .18s ease, background .18s ease;
   }
   .tile .rot.seeded { inset:34%; }                          /* one move of warning */
@@ -296,7 +297,7 @@ const CORRUPT_GROW_TURNS   = 2;    // moves between stacks once a tile is fully 
 // strategy. Counted in PLAYER MOVES, like everything else on the clock.
 const ESCALATE_EVERY = 5;          // moves between escalations
 const ESCALATE_PCT   = 0.20;       // enemy power gained per escalation
-const BOMB_HIT = 30, BOMB_MISS = 10;
+const BOMB_HIT = 20, BOMB_MISS = 7;    // -33% across the board
 const EMPOWER_MAX = 5;           // stacks one tile can hold — caps the +30%/stack ramp
 const TRAIL_MAX = 8;             // how many steps of tail the board shows behind the signal
 const WALL_TURNS = 3;            // player moves a raised wall stands before it collapses
@@ -397,8 +398,11 @@ const ABILITIES = {
     fire:     (api,e,i) => api.damagePlayer(i.dmg + i.sinceAttacked, e.name + ' (ramp ' + i.sinceAttacked + ')'),
   },
   wall: {
-    label: () => 'raise wall',
-    fire:  (api,e,i) => api.raiseWall(e),
+    // The wall is no longer free: raising it slams the player too, so a FIREWALL on the
+    // board is a damage clock as well as a routing problem — and since the hit lands, it
+    // costs the player their combo unless block eats it.
+    label: (e,i) => 'wall + ' + i.dmg + ' dmg',
+    fire:  (api,e,i) => { api.raiseWall(e); api.damagePlayer(i.dmg, e.name+' — wall slam'); },
   },
   corrupt: {
     label:   () => 'corrupt (spreads every ' + CORRUPT_SPREAD_EVERY + ' moves)',
@@ -425,7 +429,7 @@ const ABILITIES = {
 const ENEMY_DEFS = {
   gnat:   { name:'GNAT',   hp:45, abilities:[{ kind:'strike',  cd:2,  dmg:3 }] },
   daemon: { name:'DAEMON', hp:70, abilities:[{ kind:'strike',  cd:5,  dmg:6 }] },  // the original enemy
-  warden: { name:'WARDEN', hp:80, abilities:[{ kind:'wall',    cd:5 }] },
+  warden: { name:'WARDEN', hp:80, abilities:[{ kind:'wall',    cd:3, dmg:3 }] },
   siege:  { name:'SIEGE',  hp:80, abilities:[{ kind:'ramp',    cd:12, dmg:8 }] },
   blight: { name:'BLIGHT', hp:60, abilities:[{ kind:'corrupt', cd:8 }] },
   ember:  { name:'EMBER',  hp:60, abilities:[{ kind:'burn',    cd:4 }] },
