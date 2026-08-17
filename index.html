@@ -77,7 +77,16 @@
   .tile.prog.empower { color: #4ade80; }
   .tile.empowered { box-shadow: inset 0 0 0 2px #4ade80; }
   .tile .empbadge { position:absolute; bottom:2px; left:3px; font-size:10px; color:#4ade80; }
-  .tile.corrupt { background:#241026; }
+  /* Corruption is drawn as a FILL so its two stages read at a glance: a small inset box
+     while it is only seeded, the whole tile once it has taken hold. A child div rather
+     than ::before/::after, which the walls and bomb marker already claim. */
+  .tile .rot {
+    position:absolute; pointer-events:none;
+    background:#3b0f42; border:1px solid #a21caf;
+    transition: inset .18s ease, background .18s ease;
+  }
+  .tile .rot.seeded { inset:34%; }                          /* one move of warning */
+  .tile .rot.full   { inset:0; background:#241026; border-color:#c026d3; }
   .tile.corrupt.prog { border-color:#a21caf; }
   .tile .debbadge { position:absolute; top:2px; left:3px; font-size:10px; color:#e879f9; }
   .tile.burning { background:#2a1206; }
@@ -268,7 +277,15 @@
 // ---------- Config ----------
 const GRID = 5;
 const STRIKE_DMG = 10, GUARD_BLOCK = 5, COMBO_GAIN = 3, DELAY_CD = 2;
-const CSTRIKE_BASE = 8, CSTRIKE_RAMP = 3, EMPOWER_PCT = 0.30, DEBUFF_PCT = 0.20, BURN_DMG = 3;
+const CSTRIKE_BASE = 8, CSTRIKE_RAMP = 3, EMPOWER_PCT = 0.30, BURN_DMG = 3;
+// Corruption: a STAGED, growing debuff rather than a flat one.
+//   seeded (half-filled tile, 1 stack) → next move it takes hold (full tile, 2 stacks)
+//   → +1 stack every CORRUPT_GROW_TURNS from then on.
+// Stepping onto it activates the program at the CURRENT reduction and then clears it, so
+// scrubbing a mature tile costs you one bad activation — waiting makes that cost worse.
+const DEBUFF_PER_STACK   = 0.15;   // output reduction per corruption stack
+const CORRUPT_SPREAD_EVERY = 2;    // player moves between one spread and the next
+const CORRUPT_GROW_TURNS   = 2;    // moves between stacks once a tile is fully corrupted
 const BOMB_HIT = 30, BOMB_MISS = 10;
 const EMPOWER_MAX = 5;           // stacks one tile can hold — caps the +30%/stack ramp
 const TRAIL_MAX = 8;             // how many steps of tail the board shows behind the signal
@@ -303,7 +320,7 @@ const POWERS = {
   comboShield: {
     name: 'COMBO SHIELD',
     desc: t => 'a hit costs ' + t + ' combo instead of all of it',
-    tiers: [20, 15, 10],          // lower is better — the tiers improve downward
+    tiers: [10, 8, 6],            // lower is better — the tiers improve downward
     tierLabel: t => '-' + t,
   },
   momentum: {
@@ -374,7 +391,7 @@ const ABILITIES = {
     fire:  (api,e,i) => api.raiseWall(e),
   },
   corrupt: {
-    label:   () => 'corrupt (spreads/move)',
+    label:   () => 'corrupt (spreads every ' + CORRUPT_SPREAD_EVERY + ' moves)',
     onEnter: (api,e,i) => api.seedCorruption(e),          // auto-casts once on entry
     fire:    (api,e,i) => api.seedCorruption(e),
   },
@@ -505,7 +522,9 @@ function newState(){
     signal: null,        // {r,c}
     path: [],            // [{r,c}] visited in order (arm sequence source)
     walls: new Map(),    // edge key -> turns left; the signal cannot cross while it stands
-    corrupt: new Set(),  // tileKey debuffed by BLIGHT (-20% power); spreads each move
+    // tileKey -> { stacks, full, timer } — BLIGHT's rot. See DEBUFF_PER_STACK.
+    corrupt: new Map(),
+    corruptSpreadTimer: 0,   // moves since the last spread
     burn: new Map(),     // tileKey -> burn stacks (EMBER); stacks × 1 dmg on step-in
     empower: {},         // tileKey -> empower stacks, cleared when you take a hit
     cstrikeCount: 0,     // C-STRIKE activations since the last hit taken (ramp)
@@ -591,7 +610,7 @@ function tryMove(dr,dc){
   if(state.path.length > TRAIL_MAX) state.path.shift();   // the trail is a tail, not a record
   state.combo += 1;                 // each move +1 combo
   const nk = key(nr,nc);
-  if(state.corrupt.delete(nk)) log('sys','◇ cleansed corruption @'+nk);  // moving in removes it
+
   // Burn bites BEFORE the tile pays out, so stepping into fire costs you the multiplier
   // you were about to spend — the hazard and the combo reset are the same beat.
   if(state.burn.has(nk)){ const st=state.burn.get(nk); dealToPlayer(scaleAtk(BURN_DMG*st), 'BURN ×'+st+' @'+nk); }
@@ -601,7 +620,15 @@ function tryMove(dr,dc){
     const m = powerVal('momentum');
     if(m){ state.combo += m; log('cmb','MOMENTUM → +' + m + ' combo (now ' + state.combo + ')'); }
   }
+  // Stepping onto rot fires the program THROUGH it — the activation eats the full
+  // current reduction — and only then scrubs the tile clean. So clearing a mature tile
+  // is a real cost, and letting it deepen makes that cost worse.
+  const rot = state.corrupt.get(nk);
   activateTile(nk);                 // the tile fires now, at the current multiplier
+  if(rot){
+    state.corrupt.delete(nk);
+    log('sys','◇ scrubbed corruption @'+nk+' (fired at -'+Math.round(DEBUFF_PER_STACK*rot.stacks*100)+'%)');
+  }
   enemyTick();                      // moving advances enemy cooldowns
   checkWaveCleared();               // a step can finish the wave outright
   render(true);
@@ -623,15 +650,15 @@ function activateTile(k){
 }
 
 // The surface programs may touch — the prototype stand-in for core's SignalEngine sink.
-// Damage folds empower (per-tile, ×) × corruption (−20% on tile) × combo strength.
+// Damage folds empower (per-tile, ×) × corruption (per-stack, see corruptMult) × combo.
 const PROGRAM_API = {
   dealDamage(base, label, k){
     const emp = 1 + EMPOWER_PCT * (state.empower[k] || 0);
-    const deb = state.corrupt.has(k) ? (1 - DEBUFF_PCT) : 1;
+    const deb = corruptMult(k);
     dealStrike(base * emp * deb * strengthMult(), label, emp, deb);
   },
   addBlock(base, label, k){
-    const deb = state.corrupt.has(k) ? (1 - DEBUFF_PCT) : 1;
+    const deb = corruptMult(k);
     const blk = Math.round(base * deb * strengthMult());
     state.player.block += blk;
     log('blk', label + ' → +' + blk + ' block (' + Math.round(strengthMult()*100) + '%' + (deb<1?' ·-20%':'') + ')');
@@ -687,7 +714,7 @@ function tickAbility(e, inst, isMove){
 
 function enemyTick(){
   state.enemies.forEach(e=>{ if(e.alive) e.abilities.forEach(i => tickAbility(e, i, true)); });
-  spreadCorruption();                 // board-level: corruption grows one tile per move
+  tickCorruption();                   // rot matures, and spreads every other move
   decayWalls();                       // walls are temporary — they stand for WALL_TURNS moves
   checkPlayerDead();
 }
@@ -710,17 +737,27 @@ function detonateBomb(e, inst){
   inst.bombTarget = null;
 }
 
+/** Corruption stacks on a tile (0 when clean). */
+function corruptStacks(k){ return state.corrupt.get(k)?.stacks ?? 0; }
+
+/** A tile's output multiplier from corruption — never below zero. */
+function corruptMult(k){
+  return Math.max(0, 1 - DEBUFF_PER_STACK * corruptStacks(k));
+}
+
 // A tile can hold at most one modifier (corruption OR burn).
 function tileHasMod(k){ return state.corrupt.has(k) || state.burn.has(k); }
 
-// BLIGHT: corrupt a random modifier-free tile (-20% power to a program on it).
+// BLIGHT: corrupt a random modifier-free tile. It lands SEEDED (half the tile, one
+// stack) and takes hold on the player's next move — so there is always one move of
+// warning before a tile is fully rotten.
 function seedCorruption(e){
   const free=[];
   for(let r=0;r<GRID;r++) for(let c=0;c<GRID;c++){ const k=key(r,c); if(!tileHasMod(k)) free.push(k); }
   if(!free.length) return;
   const k = free[rand(free.length)];
-  state.corrupt.add(k);
-  log('dly',e.name+' → corrupted @'+k);
+  state.corrupt.set(k, { stacks: 1, full: false, timer: 0 });
+  log('dly',e.name+' → corruption seeded @'+k+' (-'+Math.round(DEBUFF_PER_STACK*100)+'%)');
 }
 
 // EMBER: set alight a random tile that isn't corrupted — free tiles ignite, already
@@ -735,22 +772,42 @@ function burnTile(e){
   log('dly',e.name+' → burning @'+k+' ('+stacks+' stack'+(stacks>1?'s':'')+')');
 }
 
-// Each move the corruption expands to one random modifier-free tile adjacent to it.
-function spreadCorruption(){
+// One per-move pass over the rot: existing tiles mature, then — every other move — the
+// blight reaches one tile further. Both are on the player's clock, so the whole mechanic
+// is measured in moves the player chose to take.
+function tickCorruption(){
   if(!state.corrupt.size) return;
+
+  // Maturation. A seeded tile takes hold on the next move (2 stacks, tile fully filled);
+  // a tile already full gains another stack every CORRUPT_GROW_TURNS.
+  for(const [k, c] of [...state.corrupt]){
+    if(!c.full){
+      c.full = true; c.stacks = 2; c.timer = 0;
+      log('dly','corruption took hold @'+k+' (-'+Math.round(DEBUFF_PER_STACK*c.stacks*100)+'%)');
+    } else if(++c.timer >= CORRUPT_GROW_TURNS){
+      c.timer = 0; c.stacks++;
+      log('dly','corruption deepens @'+k+' (-'+Math.round(DEBUFF_PER_STACK*c.stacks*100)+'%)');
+    }
+  }
+
+  // Spread only while a source is alive — kill the BLIGHT and the rot stops travelling,
+  // though what is already down keeps maturing.
   if(!state.enemies.some(e=>e.alive && e.abilities.some(a=>a.kind==='corrupt'))) return;
+  if(++state.corruptSpreadTimer < CORRUPT_SPREAD_EVERY) return;
+  state.corruptSpreadTimer = 0;
+
   const frontier = new Set();
-  state.corrupt.forEach(k=>{
-    const [r,c] = k.split(',').map(Number);
+  state.corrupt.forEach((c, k)=>{
+    const [r,c2] = k.split(',').map(Number);
     [[-1,0],[1,0],[0,-1],[0,1]].forEach(([dr,dc])=>{
-      const nr=r+dr, nc=c+dc, nk=key(nr,nc);
+      const nr=r+dr, nc=c2+dc, nk=key(nr,nc);
       if(nr>=0&&nr<GRID&&nc>=0&&nc<GRID && !tileHasMod(nk)) frontier.add(nk);
     });
   });
   if(!frontier.size) return;
   const arr = [...frontier];
   const nk = arr[rand(arr.length)];
-  state.corrupt.add(nk);
+  state.corrupt.set(nk, { stacks: 1, full: false, timer: 0 });
   log('dly','corruption spreads @'+nk);
 }
 
@@ -917,7 +974,12 @@ function render(keepFiring){
     }
     t.dataset.k = k;
     wireDrag(t, k);
-    if(state.corrupt.has(k)){ t.classList.add('corrupt'); if(type) t.innerHTML+='<span class="debbadge">-20%</span>'; }
+    const rot = state.corrupt.get(k);
+    if(rot){
+      t.classList.add('corrupt');
+      t.insertAdjacentHTML('afterbegin','<div class="rot '+(rot.full?'full':'seeded')+'"></div>');
+      if(type) t.innerHTML+='<span class="debbadge">-'+Math.round(DEBUFF_PER_STACK*rot.stacks*100)+'%</span>';
+    }
     if(state.burn.has(k)){ t.classList.add('burning'); t.innerHTML+='<span class="burnbadge">'+'🔥'.repeat(state.burn.get(k))+'</span>'; }
     if(k in bombMark){ t.insertAdjacentHTML('beforeend','<div class="bomb-marker'+(bombMark[k]?' intense':'')+'"></div>'); }
     if(state.signal && state.signal.r===r && state.signal.c===c && state.phase==='moving'){
