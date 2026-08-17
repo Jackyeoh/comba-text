@@ -162,6 +162,8 @@
   .tool-row { display:flex; align-items:center; gap:6px; margin-bottom:6px; }
   .tool-row label { color:#64748b; font-size:12px; width:88px; }
   .tool-row select { background:#0e1621; color:#cbd5e1; border:1px solid #334155; font-family:inherit; padding:4px; }
+  .tool-row input[type=range] { flex:1; min-width:80px; accent-color:#22d3ee; }
+  .scale-val { color:#22d3ee; font-size:12px; font-weight:700; width:52px; text-align:right; }
   .tool-row button { margin-top:0; padding:4px 10px; }
 </style>
 </head>
@@ -227,6 +229,24 @@
           </div>
 
           <div class="tools">
+            <div style="color:#7dd3fc;font-size:12px;letter-spacing:1px;margin-bottom:6px;">ENEMY DIALS</div>
+            <div class="tool-row">
+              <label>Enemy HP</label>
+              <input type="range" id="hpScale" min="10" max="1000" step="10" value="100">
+              <span class="scale-val" id="hpScaleVal">100%</span>
+            </div>
+            <div class="tool-row">
+              <label>Enemy ATK</label>
+              <input type="range" id="atkScale" min="10" max="1000" step="10" value="100">
+              <span class="scale-val" id="atkScaleVal">100%</span>
+            </div>
+            <div style="color:#64748b;font-size:11px;margin-bottom:4px;">
+              Applies live — HP keeps its fraction, so a wounded enemy stays wounded. Also
+              persists across Reset, so a re-roll is at the same difficulty.
+            </div>
+          </div>
+
+          <div class="tools">
             <div style="color:#7dd3fc;font-size:12px;letter-spacing:1px;margin-bottom:6px;">POWERS</div>
             <div id="powerRows"></div>
             <div style="color:#64748b;font-size:11px;margin-top:6px;">
@@ -250,6 +270,7 @@ const GRID = 5;
 const STRIKE_DMG = 10, GUARD_BLOCK = 5, COMBO_GAIN = 3, DELAY_CD = 2;
 const CSTRIKE_BASE = 8, CSTRIKE_RAMP = 3, EMPOWER_PCT = 0.30, DEBUFF_PCT = 0.20, BURN_DMG = 3;
 const BOMB_HIT = 30, BOMB_MISS = 10;
+const EMPOWER_MAX = 5;           // stacks one tile can hold — caps the +30%/stack ramp
 const TRAIL_MAX = 8;             // how many steps of tail the board shows behind the signal
 const WALL_TURNS = 3;            // player moves a raised wall stands before it collapses
 const RAMP_PER_MOVE = 3;         // SIEGE's payload growth per move it goes un-struck
@@ -362,7 +383,7 @@ const ABILITIES = {
     fire:  (api,e,i) => api.burnTile(e),
   },
   bomb: {
-    label: () => 'bomb ' + BOMB_HIT + ' / ' + BOMB_MISS + ' if fled',
+    label: () => 'bomb ' + scaleAtk(BOMB_HIT) + ' / ' + scaleAtk(BOMB_MISS) + ' if fled',
     // marker FOLLOWS you while charging (cd 2 then 1); not updated on the detonation tick
     onCd: (api,e,i) => {
       if(i.cd === 2){ i.bombTarget = api.signalKey(); api.log(e.name + ' → bomb locking on you'); }
@@ -398,11 +419,34 @@ function makeEnemy(defKey, id){
     kind: a.kind,
     cdMax: a.cd,
     cd: Math.max(1, a.cd - rand(3)),   // 0-2 cd advancement, min 1
-    dmg: a.dmg,                        // strike/ramp
+    rawDmg: a.dmg,                     // the AUTHORED figure — never scaled in place
+    dmg: scaleAtk(a.dmg),              // strike/ramp, at the current dial
     sinceAttacked: 0,                  // ramp
     bombTarget: null,                  // bomb
   }));
-  return { id, defKey, name: def.name, hp: def.hp, maxHp: def.hp, alive: true, abilities };
+  const hp = scaleHp(def.hp);
+  // rawHp is kept so dragging the HP dial rescales from the authored number rather than
+  // from the last scaled one, which would compound every time the slider moved.
+  return { id, defKey, name: def.name, rawHp: def.hp, hp, maxHp: hp, alive: true, abilities };
+}
+
+function scaleHp(v){ return Math.max(1, Math.round(v * enemyScale.hp)); }
+function scaleAtk(v){ return v == null ? v : Math.max(1, Math.round(v * enemyScale.atk)); }
+
+/**
+ * Re-apply the dials to enemies already on the board, so a slider is felt immediately
+ * instead of only on the next wave. HP keeps its FRACTION — a half-dead enemy stays half
+ * dead — because the dial is meant to change the fight's difficulty, not to heal or
+ * execute what is already in play.
+ */
+function applyEnemyScaling(){
+  state.enemies.forEach(e=>{
+    const frac = e.maxHp > 0 ? e.hp / e.maxHp : 1;
+    e.maxHp = scaleHp(e.rawHp);
+    e.hp    = e.alive ? Math.max(1, Math.round(e.maxHp * frac)) : 0;
+    e.abilities.forEach(i => { i.dmg = scaleAtk(i.rawDmg); });
+  });
+  render(true);
 }
 
 // The surface abilities are allowed to touch — the prototype's stand-in for the core
@@ -425,6 +469,12 @@ function enemyEnter(e){
 // Power selections live OUTSIDE state so a "Reset run" keeps whatever the player was
 // testing — the whole point of the toggles is comparing runs with the same picks.
 let powerSel = { comboBonus:0, startCombo:0, startGuard:0, comboShield:0, momentum:0 };
+
+// Enemy difficulty dials, as multipliers (1 = the roster's authored numbers). Also
+// outside state, so a reset re-rolls the fight at the SAME difficulty — otherwise the
+// sliders would be useless for comparing two runs.
+let enemyScale = { hp: 1, atk: 1 };
+function atkMult(){ return enemyScale.atk; }
 
 function newState(){
   // place programs: 1 strike, 1 guard, rest random
@@ -544,7 +594,7 @@ function tryMove(dr,dc){
   if(state.corrupt.delete(nk)) log('sys','◇ cleansed corruption @'+nk);  // moving in removes it
   // Burn bites BEFORE the tile pays out, so stepping into fire costs you the multiplier
   // you were about to spend — the hazard and the combo reset are the same beat.
-  if(state.burn.has(nk)){ const st=state.burn.get(nk); dealToPlayer(BURN_DMG*st, 'BURN ×'+st+' @'+nk); }
+  if(state.burn.has(nk)){ const st=state.burn.get(nk); dealToPlayer(scaleAtk(BURN_DMG*st), 'BURN ×'+st+' @'+nk); }
   // MOMENTUM turns a step onto bare silicon from pure cost into a combo builder, which
   // makes routing AROUND the board a real alternative to hopping program to program.
   if(!state.programs[nk]){
@@ -597,12 +647,18 @@ const PROGRAM_API = {
   },
   empowerNeighbors(k){
     const [r,c] = k.split(',').map(Number);
-    let n=0;
+    let n=0, capped=0;
     [[-1,0],[1,0],[0,-1],[0,1]].forEach(([dr,dc])=>{
       const nk = key(r+dr, c+dc);
-      if(state.programs[nk]){ state.empower[nk] = (state.empower[nk]||0) + 1; n++; }
+      if(!state.programs[nk]) return;
+      const cur = state.empower[nk] || 0;
+      // Capped, so a tight EMPOWER cluster can't be walked in circles for unbounded
+      // damage — past the cap the extra passes are wasted and the player has to move on.
+      if(cur >= EMPOWER_MAX){ capped++; return; }
+      state.empower[nk] = cur + 1; n++;
     });
-    log('cmb','EMPOWER (armed) → +' + Math.round(EMPOWER_PCT*100) + '% base dmg to ' + n + ' neighbour(s)');
+    log('cmb','EMPOWER → +' + Math.round(EMPOWER_PCT*100) + '% base dmg to ' + n + ' neighbour(s)'
+      + (capped ? ' ('+capped+' already at cap '+EMPOWER_MAX+')' : ''));
   },
   delayRandomAbility(){
     const alive = state.enemies.filter(e=>e.alive);
@@ -649,7 +705,7 @@ function decayWalls(){
 function detonateBomb(e, inst){
   const target = inst.bombTarget || signalKey();
   const direct = target!=null && signalKey()===target;
-  const dmg = direct ? BOMB_HIT : BOMB_MISS;
+  const dmg = scaleAtk(direct ? BOMB_HIT : BOMB_MISS);   // the dial covers bombs too
   dealToPlayer(dmg, e.name+(direct?' — DIRECT HIT':' — near miss')+' @'+target);
   inst.bombTarget = null;
 }
@@ -972,6 +1028,22 @@ function addEnemy(type){
   render(true);
 }
 
+// ---------- Enemy dials ----------
+// Two multipliers over the roster's authored numbers, 10%..1000%. They re-apply to the
+// live board on every input so the effect is felt while dragging, not on the next wave.
+function wireEnemyDials(){
+  [['hp','hpScale','hpScaleVal'], ['atk','atkScale','atkScaleVal']].forEach(([field, id, valId])=>{
+    const el = document.getElementById(id), out = document.getElementById(valId);
+    el.value = Math.round(enemyScale[field] * 100);
+    out.textContent = el.value + '%';
+    el.addEventListener('input', ()=>{
+      enemyScale[field] = (+el.value) / 100;
+      out.textContent = el.value + '%';
+      applyEnemyScaling();
+    });
+  });
+}
+
 // ---------- Powers panel ----------
 // One row per power: a checkbox to arm it and a tier picker. Changes apply from the next
 // combo onward (and immediately for anything read live, like COMBO BONUS), so a run can
@@ -1035,6 +1107,7 @@ function updateToolState(){
 function start(){
   state = newState();
   buildPowerRows();
+  wireEnemyDials();
   banner('SETUP · arrange your programs', '#7dd3fc');
   logEl.innerHTML='';
   log('sys','Loadout: '+Object.values(state.programs).map(t=>PROGRAMS[t].abbr).join(' ')+' — drag to arrange, then START.');
