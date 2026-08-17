@@ -22,6 +22,29 @@
   .row-main { display: flex; gap: 24px; align-items: flex-start; }
   .side-col { display: flex; flex-direction: column; gap: 16px; flex: 1; min-width: 240px; }
 
+  /* Combo readout — floats over the board's top-left corner rather than sitting in the
+     side panel, so the number the player is spending is in the same glance as the tile
+     they are about to step on. */
+  .board-wrap { position: relative; }
+  .combo-hud {
+    position: absolute; top: 8px; left: 10px; z-index: 20;
+    pointer-events: none; line-height: 1;
+    display: flex; flex-direction: column; gap: 2px;
+  }
+  .combo-hud .combo-n {
+    font-size: 26px; font-weight: 800; color: #fbbf24;
+    text-shadow: 0 0 10px rgba(251,191,36,.55), 0 2px 3px #000;
+  }
+  .combo-hud .combo-pct {
+    font-size: 13px; font-weight: 700; letter-spacing: .06em; color: #22d3ee;
+    text-shadow: 0 0 8px rgba(34,211,238,.5), 0 1px 2px #000;
+  }
+  /* Bumps on each gain, so growth is felt rather than read. */
+  .combo-hud.bump .combo-n { animation: combo-bump .22s ease-out; }
+  @keyframes combo-bump {
+    0% { transform: scale(1); } 45% { transform: scale(1.25); color: #fff; } 100% { transform: scale(1); }
+  }
+
   /* Board */
   .board {
     display: grid;
@@ -68,11 +91,6 @@
   .tile .arms {
     position: absolute; top: 2px; right: 4px;
     font-size: 10px; color: #22c55e;
-  }
-  .tile.pathmark::after {
-    content: ""; position: absolute; inset: 0;
-    background: rgba(34,197,94, var(--path-alpha, 0.10));
-    pointer-events: none;
   }
   .tile.signal { box-shadow: inset 0 0 0 2px #22d3ee; }
   .tile.signal .dot {
@@ -162,7 +180,13 @@
 
     <!-- Row 2: board + side column (player info + desc/debug controls) -->
     <div class="row-main">
-      <div class="board" id="board"></div>
+      <div class="board-wrap">
+        <div class="combo-hud" id="comboHud">
+          <span class="combo-n"   id="comboN">0</span>
+          <span class="combo-pct" id="comboPct">100%</span>
+        </div>
+        <div class="board" id="board"></div>
+      </div>
       <div class="side-col">
         <div class="panel">
           <h2>Player</h2>
@@ -183,7 +207,8 @@
             <b>Setup:</b> drag a program onto an empty tile to move it, or onto another to swap — then START.<br>
             <b>Combat:</b> Arrows / WASD move signal &nbsp;·&nbsp; <b>click an enemy</b> to target it. Layout is locked.<br>
             Each move = +1 combo (+10% signal strength) and fires the tile you land on. Moving decrements enemy cooldowns. Orange bars are walls.<br>
-            <b>Any damage that gets through resets your combo</b> — blocked damage does not, so GUARD protects the streak as well as the health.
+            <b>Any damage that gets through resets your combo</b> — blocked damage does not, so GUARD protects the streak as well as the health.<br>
+            <b>POWERS</b> below are toggle-able run modifiers; they persist across Reset so two runs can be compared on the same picks.
           </div>
           <button id="startBtn">▶ Start combat</button>
           <button id="reset">Reset run</button>
@@ -198,6 +223,14 @@
               <label>Add enemy</label>
               <select id="addEnemySel"></select>
               <button id="addEnemyBtn">+ spawn</button>
+            </div>
+          </div>
+
+          <div class="tools">
+            <div style="color:#7dd3fc;font-size:12px;letter-spacing:1px;margin-bottom:6px;">POWERS</div>
+            <div id="powerRows"></div>
+            <div style="color:#64748b;font-size:11px;margin-top:6px;">
+              Toggles survive a run reset, so two runs can be compared on the same picks.
             </div>
           </div>
         </div>
@@ -218,7 +251,53 @@ const STRIKE_DMG = 10, GUARD_BLOCK = 5, COMBO_GAIN = 3, DELAY_CD = 2;
 const CSTRIKE_BASE = 8, CSTRIKE_RAMP = 3, EMPOWER_PCT = 0.30, DEBUFF_PCT = 0.20, BURN_DMG = 3;
 const BOMB_HIT = 30, BOMB_MISS = 10;
 const TRAIL_MAX = 8;             // how many steps of tail the board shows behind the signal
+const WALL_TURNS = 3;            // player moves a raised wall stands before it collapses
+const RAMP_PER_MOVE = 3;         // SIEGE's payload growth per move it goes un-struck
 const PROGRAM_COUNT = 7;         // total programs placed (incl. 1 strike + 1 guard)
+
+// ---------- Powers ----------
+// Toggle-able run modifiers, the prototype's stand-in for meta/relic picks. Each is a
+// list of TIERS; `state.powers[id]` holds 0 (off) or the 1-based tier. Everything reads
+// them through powerVal(), so a power is one entry here plus wherever it applies —
+// there is no per-power branching anywhere else.
+const POWERS = {
+  comboBonus: {
+    name: 'COMBO BONUS',
+    desc: t => 'each combo point is worth +' + Math.round((0.10 + t) * 100) + '% (base 10%)',
+    tiers: [0.05, 0.10, 0.15],
+    tierLabel: t => '+' + Math.round(t * 100) + '%',
+  },
+  startCombo: {
+    name: 'HEAD START',
+    desc: t => 'combos begin at ' + t + ' instead of 0',
+    tiers: [3, 6, 9],
+    tierLabel: t => String(t),
+  },
+  startGuard: {
+    name: 'OPENING GUARD',
+    desc: t => 'gain ' + t + ' block whenever a combo starts',
+    tiers: [5, 10, 15],
+    tierLabel: t => String(t),
+  },
+  comboShield: {
+    name: 'COMBO SHIELD',
+    desc: t => 'a hit costs ' + t + ' combo instead of all of it',
+    tiers: [20, 15, 10],          // lower is better — the tiers improve downward
+    tierLabel: t => '-' + t,
+  },
+  momentum: {
+    name: 'MOMENTUM',
+    desc: () => '+4 combo whenever you step onto an EMPTY cell',
+    tiers: [4],
+    tierLabel: t => '+' + t,
+  },
+};
+
+/** The active value of a power, or 0 when it is switched off. */
+function powerVal(id){
+  const tier = state?.powers?.[id] ?? 0;
+  return tier ? POWERS[id].tiers[tier - 1] : 0;
+}
 
 // ---------- Program registry ----------
 // A program is presentation (abbr/name/desc; the KEY doubles as its CSS class) plus
@@ -264,8 +343,8 @@ const ABILITIES = {
     fire:  (api,e,i) => api.damagePlayer(i.dmg, e.name),
   },
   ramp: {
-    label:    (e,i) => 'attack ' + (i.dmg + i.sinceAttacked) + ' (ramps +1/move)',
-    onMove:   (api,e,i) => { i.sinceAttacked += 1; },     // grows while un-struck
+    label:    (e,i) => 'attack ' + (i.dmg + i.sinceAttacked) + ' (ramps +3/move)',
+    onMove:   (api,e,i) => { i.sinceAttacked += RAMP_PER_MOVE; },   // grows while un-struck
     onStruck: (api,e,i) => { i.sinceAttacked = 0; },      // striking it resets the ramp
     fire:     (api,e,i) => api.damagePlayer(i.dmg + i.sinceAttacked, e.name + ' (ramp ' + i.sinceAttacked + ')'),
   },
@@ -296,9 +375,9 @@ const ABILITIES = {
 
 // Enemy roster — stats + which ability instances the enemy fields.
 const ENEMY_DEFS = {
-  gnat:   { name:'GNAT',   hp:45, abilities:[{ kind:'strike',  cd:1,  dmg:2 }] },
+  gnat:   { name:'GNAT',   hp:45, abilities:[{ kind:'strike',  cd:2,  dmg:3 }] },
   daemon: { name:'DAEMON', hp:70, abilities:[{ kind:'strike',  cd:5,  dmg:6 }] },  // the original enemy
-  warden: { name:'WARDEN', hp:80, abilities:[{ kind:'wall',    cd:6 }] },
+  warden: { name:'WARDEN', hp:80, abilities:[{ kind:'wall',    cd:5 }] },
   siege:  { name:'SIEGE',  hp:80, abilities:[{ kind:'ramp',    cd:12, dmg:8 }] },
   blight: { name:'BLIGHT', hp:60, abilities:[{ kind:'corrupt', cd:8 }] },
   ember:  { name:'EMBER',  hp:60, abilities:[{ kind:'burn',    cd:4 }] },
@@ -343,6 +422,10 @@ function enemyEnter(e){
   e.abilities.forEach(i => { const ab = ABILITIES[i.kind]; if(ab.onEnter) ab.onEnter(ENEMY_API, e, i); });
 }
 
+// Power selections live OUTSIDE state so a "Reset run" keeps whatever the player was
+// testing — the whole point of the toggles is comparing runs with the same picks.
+let powerSel = { comboBonus:0, startCombo:0, startGuard:0, comboShield:0, momentum:0 };
+
 function newState(){
   // place programs: 1 strike, 1 guard, rest random
   const bag = ['strike','guard'];
@@ -371,18 +454,20 @@ function newState(){
     combo: 0,
     signal: null,        // {r,c}
     path: [],            // [{r,c}] visited in order (arm sequence source)
-    walls: new Set(),    // edge keys the signal cannot cross (see edgeKey)
+    walls: new Map(),    // edge key -> turns left; the signal cannot cross while it stands
     corrupt: new Set(),  // tileKey debuffed by BLIGHT (-20% power); spreads each move
     burn: new Map(),     // tileKey -> burn stacks (EMBER); stacks × 1 dmg on step-in
     empower: {},         // tileKey -> empower stacks, cleared when you take a hit
     cstrikeCount: 0,     // C-STRIKE activations since the last hit taken (ramp)
     targetId: null,      // enemy the player's strikes aim at (null = random)
+    powers: powerSel,    // id -> 0 (off) or 1-based tier; see POWERS
     phase: 'setup',      // setup | moving | over
     over: false,
   };
 }
 
-function strengthMult(){ return 1 + 0.1 * state.combo; }
+// The one place combo becomes damage. COMBO BONUS raises what each point is worth.
+function strengthMult(){ return 1 + (0.1 + powerVal('comboBonus')) * state.combo; }
 
 // ---------- Targeting ----------
 // Explicit selection (state.targetId) or, when unset/dead, a random living enemy.
@@ -424,10 +509,20 @@ function spawnSignal(){
 
 // Everything the player builds up by moving without being hit. Cleared together,
 // because they are one resource: momentum. Losing it is what a hit COSTS.
+//
+// This is also where a combo BEGINS, so the powers that pay out at the start of one
+// (HEAD START's floor, OPENING GUARD's block) land here — there is one definition of
+// "a new combo", and both read from it.
 function resetMomentum(){
-  state.combo = 0;
+  state.combo = powerVal('startCombo');
   state.empower = {};
   state.cstrikeCount = 0;
+  const guard = powerVal('startGuard');
+  if(guard){
+    state.player.block += guard;
+    log('blk','OPENING GUARD → +' + guard + ' block');
+  }
+  if(state.combo) log('cmb','HEAD START → combo opens at ' + state.combo);
 }
 
 // ---------- Movement ----------
@@ -450,6 +545,12 @@ function tryMove(dr,dc){
   // Burn bites BEFORE the tile pays out, so stepping into fire costs you the multiplier
   // you were about to spend — the hazard and the combo reset are the same beat.
   if(state.burn.has(nk)){ const st=state.burn.get(nk); dealToPlayer(BURN_DMG*st, 'BURN ×'+st+' @'+nk); }
+  // MOMENTUM turns a step onto bare silicon from pure cost into a combo builder, which
+  // makes routing AROUND the board a real alternative to hopping program to program.
+  if(!state.programs[nk]){
+    const m = powerVal('momentum');
+    if(m){ state.combo += m; log('cmb','MOMENTUM → +' + m + ' combo (now ' + state.combo + ')'); }
+  }
   activateTile(nk);                 // the tile fires now, at the current multiplier
   enemyTick();                      // moving advances enemy cooldowns
   checkWaveCleared();               // a step can finish the wave outright
@@ -531,7 +632,17 @@ function tickAbility(e, inst, isMove){
 function enemyTick(){
   state.enemies.forEach(e=>{ if(e.alive) e.abilities.forEach(i => tickAbility(e, i, true)); });
   spreadCorruption();                 // board-level: corruption grows one tile per move
+  decayWalls();                       // walls are temporary — they stand for WALL_TURNS moves
   checkPlayerDead();
+}
+
+// A raised wall stands for a few moves and then collapses, so a severed route is a
+// detour to wait out rather than a permanent hole in the board.
+function decayWalls(){
+  for(const [w, turns] of [...state.walls]){
+    if(turns <= 1){ state.walls.delete(w); log('sys','◇ wall collapsed @'+w); }
+    else state.walls.set(w, turns - 1);
+  }
 }
 
 // BOMBER: 30 dmg if the signal is on the telegraphed tile, else 10.
@@ -599,8 +710,8 @@ function placeWall(e){
   const src = withProg.length ? withProg : any;
   if(!src.length){ log('sys',e.name+' found nowhere to wall'); return; }
   const w = src[rand(src.length)];
-  state.walls.add(w);
-  log('dly',e.name+' → wall raised'+(withProg.length?' between programs':'')+' @'+w);
+  state.walls.set(w, WALL_TURNS);
+  log('dly',e.name+' → wall raised'+(withProg.length?' between programs':'')+' @'+w+' ('+WALL_TURNS+' turns)');
 }
 
 function dealToPlayer(amt, src){
@@ -614,14 +725,24 @@ function dealToPlayer(amt, src){
     log('dmg', src+' hits for '+amt);
   }
   state.player.hp -= dmg;
-  // A hit that actually LANDS wipes the momentum you were spending. Damage stopped by
-  // block does not — block is what buys you the right to keep your combo, which is the
-  // whole reason to spend steps on GUARD instead of on another weapon.
-  if(dmg > 0 && state.combo > 0){
-    log('cmb','✕ hit — combo reset (was '+state.combo+')');
-    resetMomentum();
-  } else if(dmg > 0){
-    resetMomentum();
+  // A hit that actually LANDS costs momentum. Damage stopped by block does not — block
+  // is what buys the right to keep a combo, which is the whole reason to spend steps on
+  // GUARD instead of on another weapon.
+  //
+  // COMBO SHIELD changes the price from "all of it" to a fixed toll, so a long combo
+  // survives a hit it would otherwise have ended. It never drops below the HEAD START
+  // floor, so the two powers stack the way the player would expect.
+  if(dmg > 0){
+    const toll = powerVal('comboShield');
+    if(toll){
+      const floor = powerVal('startCombo');
+      const paid  = Math.min(toll, Math.max(0, state.combo - floor));
+      state.combo = Math.max(floor, state.combo - toll);
+      log('cmb','✕ hit — COMBO SHIELD paid ' + paid + ' combo (now ' + state.combo + ')');
+    } else {
+      if(state.combo > 0) log('cmb','✕ hit — combo reset (was '+state.combo+')');
+      resetMomentum();
+    }
   }
 }
 
@@ -679,6 +800,7 @@ const logEl = document.getElementById('log');
 
 // The tile that fired on the last step, highlighted until the next one.
 let firingCell = null;
+let lastComboShown = 0;   // drives the combo readout's bump on a gain
 
 // ---------- Drag to rearrange programs ----------
 // Only during the pre-combat setup phase; locked once combat starts.
@@ -712,17 +834,10 @@ function wireDrag(el, k){
 function render(keepFiring){
   // board
   boardEl.innerHTML='';
-  const pathKeys = new Set(state.path.map(p=>key(p.r,p.c)));
   const armCount = {};
   state.path.forEach(p=>{ const k=key(p.r,p.c); if(state.programs[k]) armCount[k]=(armCount[k]||0)+1; });
-  // recency gradient: brightest = most recently left tile, fading back toward spawn.
-  // The live signal tile is excluded (it shows its own cyan highlight).
-  const signalK = (state.phase==='moving' && state.signal) ? key(state.signal.r,state.signal.c) : null;
-  const lastIdx = {};
-  state.path.forEach((p,i)=>{ const kk=key(p.r,p.c); if(kk!==signalK) lastIdx[kk]=i; });
-  const ordered = Object.entries(lastIdx).sort((a,b)=>a[1]-b[1]).map(e=>e[0]);
-  const pathAlpha = {};
-  ordered.forEach((kk,idx)=>{ pathAlpha[kk] = ordered.length>1 ? idx/(ordered.length-1) : 1; });
+  // No path trail: the gradient existed to show the ARM ORDER the backward trace would
+  // replay, and every tile now fires on the step, so there is no order left to read.
   // Board telegraph markers, sourced from each ability's telegraph() hook (BOMBER)
   const bombMark = {};
   state.enemies.forEach(e=>{
@@ -746,10 +861,6 @@ function render(keepFiring){
     }
     t.dataset.k = k;
     wireDrag(t, k);
-    if(pathKeys.has(k) && k!==signalK){
-      t.classList.add('pathmark');
-      t.style.setProperty('--path-alpha', (0.10 + 0.42*pathAlpha[k]).toFixed(3));
-    }
     if(state.corrupt.has(k)){ t.classList.add('corrupt'); if(type) t.innerHTML+='<span class="debbadge">-20%</span>'; }
     if(state.burn.has(k)){ t.classList.add('burning'); t.innerHTML+='<span class="burnbadge">'+'🔥'.repeat(state.burn.get(k))+'</span>'; }
     if(k in bombMark){ t.insertAdjacentHTML('beforeend','<div class="bomb-marker'+(bombMark[k]?' intense':'')+'"></div>'); }
@@ -768,6 +879,14 @@ function render(keepFiring){
   document.getElementById('blockText').textContent = state.player.block>0 ? '🛡 '+state.player.block+' block' : '';
   document.getElementById('comboText').textContent = state.combo;
   document.getElementById('strengthText').textContent = Math.round(strengthMult()*100)+'%';
+  // Floating readout over the board — the same two numbers, where the player is looking.
+  const hud = document.getElementById('comboHud');
+  document.getElementById('comboN').textContent = state.combo;
+  document.getElementById('comboPct').textContent = Math.round(strengthMult()*100)+'%';
+  if(state.combo > (lastComboShown ?? 0)){
+    hud.classList.remove('bump'); void hud.offsetWidth; hud.classList.add('bump');
+  }
+  lastComboShown = state.combo;
   // enemies
   const aliveCount = state.enemies.filter(e=>e.alive).length;
   document.getElementById('enemiesTitle').textContent =
@@ -853,6 +972,57 @@ function addEnemy(type){
   render(true);
 }
 
+// ---------- Powers panel ----------
+// One row per power: a checkbox to arm it and a tier picker. Changes apply from the next
+// combo onward (and immediately for anything read live, like COMBO BONUS), so a run can
+// be re-rolled with different picks by hitting Reset.
+function buildPowerRows(){
+  const host = document.getElementById('powerRows');
+  host.innerHTML = '';
+  Object.entries(POWERS).forEach(([id, def])=>{
+    const row = document.createElement('div');
+    row.className = 'tool-row';
+    row.style.alignItems = 'flex-start';
+
+    const on = document.createElement('input');
+    on.type = 'checkbox';
+    on.checked = powerSel[id] > 0;
+
+    const label = document.createElement('label');
+    label.style.width = '120px';
+    label.style.color = '#cbd5e1';
+    label.textContent = def.name;
+
+    const tier = document.createElement('select');
+    def.tiers.forEach((t, i)=>{
+      const o = document.createElement('option');
+      o.value = i + 1;
+      o.textContent = def.tierLabel(t);
+      tier.appendChild(o);
+    });
+    tier.value = Math.max(1, powerSel[id]);
+    tier.disabled = !on.checked;
+
+    const desc = document.createElement('span');
+    desc.style.cssText = 'color:#64748b;font-size:11px;flex:1;';
+    const syncDesc = ()=>{ desc.textContent = def.desc(def.tiers[(+tier.value) - 1]); };
+    syncDesc();
+
+    const apply = ()=>{
+      powerSel[id] = on.checked ? +tier.value : 0;
+      if(state) state.powers = powerSel;
+      tier.disabled = !on.checked;
+      syncDesc();
+      render(true);
+    };
+    on.addEventListener('change', apply);
+    tier.addEventListener('change', apply);
+
+    row.append(on, label, tier, desc);
+    host.appendChild(row);
+  });
+}
+
 function updateToolState(){
   const setup = state.phase==='setup' && !state.over;
   document.getElementById('addProgSel').disabled = !setup;
@@ -864,6 +1034,7 @@ function updateToolState(){
 
 function start(){
   state = newState();
+  buildPowerRows();
   banner('SETUP · arrange your programs', '#7dd3fc');
   logEl.innerHTML='';
   log('sys','Loadout: '+Object.values(state.programs).map(t=>PROGRAMS[t].abbr).join(' ')+' — drag to arrange, then START.');
