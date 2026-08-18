@@ -282,6 +282,19 @@
           </div>
 
           <div class="tools">
+            <div style="color:#7dd3fc;font-size:12px;letter-spacing:1px;margin-bottom:6px;">PLAYER DIALS</div>
+            <div class="tool-row">
+              <label>Block lasts</label>
+              <input type="range" id="blockTurnsScale" min="1" max="10" step="1" value="2">
+              <span class="scale-val" id="blockTurnsVal">2</span>
+            </div>
+            <div style="color:#64748b;font-size:11px;margin-bottom:4px;">
+              Moves a banked block charge survives. Charges already standing keep the life
+              they were banked with.
+            </div>
+          </div>
+
+          <div class="tools">
             <div style="color:#7dd3fc;font-size:12px;letter-spacing:1px;margin-bottom:6px;">POWERS</div>
             <div id="powerRows"></div>
             <div style="color:#64748b;font-size:11px;margin-top:6px;">
@@ -319,7 +332,7 @@ const ESCALATE_EVERY = 5;          // moves between escalations after that
 const ESCALATE_PCT   = 0.20;       // enemy power gained per escalation
 // Block is banked in CHARGES, each with its own short life, so shielding is something
 // you spend on the turn you need it rather than a pool you hoard across the fight.
-const BLOCK_TURNS = 2;             // player moves a banked block charge survives
+const BLOCK_TURNS_DEFAULT = 2;     // player moves a banked block charge survives
 const CHAIN_STEP_MS = 260;         // pace the backward chain resolves at, in TRACE mode
 // RELAY: activating it starts a RUN of N moves (N = base, +1 per RELAY_PER_COMBO combo
 // held when it fires). On each of those moves it activates ONE random adjacent program.
@@ -363,7 +376,7 @@ const POWERS = {
   },
   startGuard: {
     name: 'OPENING GUARD',
-    desc: t => 'gain ' + t + ' block whenever a combo starts (lasts 2 turns)',
+    desc: t => 'gain ' + t + ' block whenever a combo starts (lasts ' + blockTurns + ' turns)',
     tiers: [5, 10, 15],
     tierLabel: t => String(t),
   },
@@ -403,7 +416,7 @@ const PROGRAMS = {
              resolve:(api,k)=> api.dealDamage(STRIKE_DMG, 'STRIKE', k) },
   cstrike: { abbr:'CST', name:'C-STRIKE', desc:'deal 8 dmg, +3 per C-STRIKE since your last hit', resolveOn:'trace',
              resolve:(api,k)=>{ const base = api.cstrikeRamp(); api.dealDamage(base, 'C-STRIKE(base '+base+')', k); } },
-  guard:   { abbr:'GRD', name:'GUARD',    desc:'gain 10 block (lasts 2 turns)', resolveOn:'trace',
+  guard:   { abbr:'GRD', name:'GUARD',    desc:'gain 10 block (expires — see the BLOCK LASTS dial)', resolveOn:'trace',
              resolve:(api,k)=> api.addBlock(GUARD_BLOCK, 'GUARD', k) },
   combo:   { abbr:'CMB', name:'COMBO',    desc:'+3 combo', resolveOn:'arm',
              resolve:(api,k)=> api.addCombo(COMBO_GAIN) },
@@ -552,6 +565,10 @@ let enemyScale = { hp: 1, atk: 1 };
 // escalation counter FREEZES rather than resetting, so switching it back on resumes from
 // where the fight left off instead of handing the player a free reprieve.
 let escalationOn = true;
+// How long a banked block charge survives, in player moves. A dial rather than a
+// constant because it is the single number that decides whether defending is worth a
+// step at all. Lives outside state, so a Reset keeps whatever is being tested.
+let blockTurns = BLOCK_TURNS_DEFAULT;
 // True while RELAY is paying out, so a relayed RELAY cannot queue another round — a
 // cluster of them would otherwise compound forever off a single trigger.
 let relayGuard = false;
@@ -562,7 +579,7 @@ function atkMult(){ return enemyScale.atk * (1 + ESCALATE_PCT * (state?.escalati
 
 function newState(){
   // place programs: 1 strike, 1 guard, rest random
-  // Two GUARDs are guaranteed: with block expiring after BLOCK_TURNS, a single one
+  // Two GUARDs are guaranteed: with block expiring after blockTurns moves, a single one
   // cannot keep a shield up often enough for defending to be a live option at all.
   const bag = ['strike','guard','guard'];
   const pool = ['strike','cstrike','guard','combo','delay','empower','relay'];
@@ -586,7 +603,7 @@ function newState(){
   return {
     programs, enemies, nextEnemyId: enemies.length,
     wave: 1, maxWaves: WAVE_COUNT,
-    // blocks: [{ amount, turns }] — each charge expires on its own clock (BLOCK_TURNS).
+    // blocks: [{ amount, turns }] — each charge expires on its own clock (see blockTurns).
     player: { hp:100, maxHp:100, blocks: [] },
     combo: 0,
     signal: null,        // {r,c}
@@ -619,7 +636,9 @@ function blockTotal(){ return state.player.blocks.reduce((n,b)=>n+b.amount, 0); 
 /** Bank a charge with a fresh life. */
 function bankBlock(amount){
   const amt = Math.round(amount);
-  if(amt > 0) state.player.blocks.push({ amount: amt, turns: BLOCK_TURNS });
+  // Banked at the CURRENT setting; charges already standing keep the life they were
+  // banked with, so changing the dial never rewrites shields the player already earned.
+  if(amt > 0) state.player.blocks.push({ amount: amt, turns: blockTurns });
   return amt;
 }
 
@@ -859,7 +878,7 @@ function enemyTick(){
   tickCorruption();                   // rot matures, and spreads every other move
   decayWalls();                       // walls are temporary — they stand for WALL_TURNS moves
   tickRelay();                        // RELAY pays out one queued activation per move
-  tickBlock();                        // banked block ages out after BLOCK_TURNS moves
+  tickBlock();                        // banked block ages out after blockTurns moves
   tickEscalation();                   // the fight itself gets harder the longer it runs
   checkPlayerDead();
 }
@@ -1377,6 +1396,16 @@ function addEnemy(type){
 // Two multipliers over the roster's authored numbers, 10%..1000%. They re-apply to the
 // live board on every input so the effect is felt while dragging, not on the next wave.
 function wireEnemyDials(){
+  const bt = document.getElementById('blockTurnsScale'), btOut = document.getElementById('blockTurnsVal');
+  bt.value = blockTurns;
+  btOut.textContent = blockTurns;
+  bt.addEventListener('input', ()=>{
+    blockTurns = +bt.value;
+    btOut.textContent = bt.value;
+    buildPowerRows();   // OPENING GUARD's description quotes the duration
+    render(true);
+  });
+
   const esc = document.getElementById('escToggle');
   esc.checked = escalationOn;
   esc.addEventListener('change', ()=>{
