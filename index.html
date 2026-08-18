@@ -223,10 +223,19 @@
           <div class="keys">
             <b>Setup:</b> drag a program onto an empty tile to move it, or onto another to swap — then START.<br>
             <b>Combat:</b> Arrows / WASD move signal &nbsp;·&nbsp; <b>click an enemy</b> to target it. Layout is locked.<br>
-            Each move = +1 combo (+10% signal strength) and fires the tile you land on. Moving decrements enemy cooldowns. Orange bars are walls.<br>
+            <b>Move-activate:</b> each step fires the tile you land on, and a landed hit clears your combo.<br>
+            <b>Commit + traceback:</b> stepping ARMS programs, <b>SPACE</b> fires the armed chain in reverse, then the signal respawns and combo resets — a hit does not clear it.<br>
+            Each move = +1 combo (+10% signal strength). Moving decrements enemy cooldowns. Orange bars are walls.<br>
             <b>Every 5 moves the enemy gains +20% power</b> — stalling is not a strategy.<br>
             <b>Any damage that gets through resets your combo</b> — blocked damage does not, so GUARD protects the streak as well as the health.<br>
             <b>POWERS</b> below are toggle-able run modifiers; they persist across Reset so two runs can be compared on the same picks.
+          </div>
+          <div class="tool-row" id="modeRow" style="margin-bottom:8px;">
+            <label>Mode</label>
+            <select id="modeSel">
+              <option value="move">Move-activate</option>
+              <option value="trace">Commit + traceback</option>
+            </select>
           </div>
           <button id="startBtn">▶ Start combat</button>
           <button id="reset">Reset run</button>
@@ -283,7 +292,7 @@
 <script>
 // ---------- Config ----------
 const GRID = 5;
-const STRIKE_DMG = 10, GUARD_BLOCK = 5, COMBO_GAIN = 3, DELAY_CD = 2;
+const STRIKE_DMG = 10, GUARD_BLOCK = 10, COMBO_GAIN = 3, DELAY_CD = 2;
 const CSTRIKE_BASE = 8, CSTRIKE_RAMP = 3, EMPOWER_PCT = 0.30, BURN_DMG = 3;
 // Corruption: a STAGED, growing debuff rather than a flat one.
 //   seeded (half-filled tile, 1 stack) → next move it takes hold (full tile, 2 stacks)
@@ -300,6 +309,16 @@ const ESCALATE_PCT   = 0.20;       // enemy power gained per escalation
 // Block is banked in CHARGES, each with its own short life, so shielding is something
 // you spend on the turn you need it rather than a pool you hoard across the fight.
 const BLOCK_TURNS = 2;             // player moves a banked block charge survives
+const CHAIN_STEP_MS = 260;         // pace the backward chain resolves at, in TRACE mode
+
+// Two combat models, switchable before START and locked for the fight:
+//   'move'  — every program fires the instant you step on it, at the current combo.
+//             The signal runs until the fight ends; TAKING A HIT clears your combo.
+//   'trace' — the original: stepping ARMS programs, SPACE fires the armed chain in
+//             reverse, then the signal respawns and combo resets with it. A hit does
+//             not clear combo here — the commit is the boundary.
+let comboMode = 'move';
+function isTrace(){ return (state?.mode ?? comboMode) === 'trace'; }
 const BOMB_HIT = 20, BOMB_MISS = 7;    // -33% across the board
 const EMPOWER_MAX = 5;           // stacks one tile can hold — caps the +30%/stack ramp
 const TRAIL_MAX = 8;             // how many steps of tail the board shows behind the signal
@@ -357,21 +376,23 @@ function powerVal(id){
 // surface it may touch — the prototype stand-in for core's BaseProgram + SignalEngine.
 // Adding a program is one entry here; no engine edits.
 //
-// EVERY program fires the instant the signal steps onto it, at whatever the combo
-// multiplier is worth right then. There is no arm/trace split any more: the player's
-// decision is which tile to step on next, and the answer pays out immediately.
+// WHEN a program fires depends on the mode (see comboMode):
+//   'move'  — every program resolves the instant the signal steps on it, and resolveOn
+//             is ignored.
+//   'trace' — resolveOn 'arm' fires on the pass; resolveOn 'trace' waits for the
+//             backward chain SPACE kicks off.
 const PROGRAMS = {
-  strike:  { abbr:'STR', name:'STRIKE',   desc:'deal 10 dmg',
+  strike:  { abbr:'STR', name:'STRIKE',   desc:'deal 10 dmg', resolveOn:'trace',
              resolve:(api,k)=> api.dealDamage(STRIKE_DMG, 'STRIKE', k) },
-  cstrike: { abbr:'CST', name:'C-STRIKE', desc:'deal 8 dmg, +3 per C-STRIKE since your last hit',
+  cstrike: { abbr:'CST', name:'C-STRIKE', desc:'deal 8 dmg, +3 per C-STRIKE since your last hit', resolveOn:'trace',
              resolve:(api,k)=>{ const base = api.cstrikeRamp(); api.dealDamage(base, 'C-STRIKE(base '+base+')', k); } },
-  guard:   { abbr:'GRD', name:'GUARD',    desc:'gain 5 block (lasts 2 turns)',
+  guard:   { abbr:'GRD', name:'GUARD',    desc:'gain 10 block (lasts 2 turns)', resolveOn:'trace',
              resolve:(api,k)=> api.addBlock(GUARD_BLOCK, 'GUARD', k) },
-  combo:   { abbr:'CMB', name:'COMBO',    desc:'+3 combo',
+  combo:   { abbr:'CMB', name:'COMBO',    desc:'+3 combo', resolveOn:'arm',
              resolve:(api,k)=> api.addCombo(COMBO_GAIN) },
-  delay:   { abbr:'DLY', name:'DELAY',    desc:'+2 cd to a random enemy ability',
+  delay:   { abbr:'DLY', name:'DELAY',    desc:'+2 cd to a random enemy ability', resolveOn:'arm',
              resolve:(api,k)=> api.delayRandomAbility() },
-  empower: { abbr:'EMP', name:'EMPOWER',  desc:'+30% base dmg to adjacent programs (until you are hit)',
+  empower: { abbr:'EMP', name:'EMPOWER',  desc:'+30% base dmg to adjacent programs (until you are hit)', resolveOn:'arm',
              resolve:(api,k)=> api.empowerNeighbors(k) },
 };
 
@@ -552,6 +573,7 @@ function newState(){
     empower: {},         // tileKey -> empower stacks, cleared when you take a hit
     cstrikeCount: 0,     // C-STRIKE activations since the last hit taken (ramp)
     targetId: null,      // enemy the player's strikes aim at (null = random)
+    mode: comboMode,     // 'move' | 'trace' — locked once combat starts
     powers: powerSel,    // id -> 0 (off) or 1-based tier; see POWERS
     phase: 'setup',      // setup | moving | over
     over: false,
@@ -628,7 +650,8 @@ function spawnSignal(){
   const [r,c] = k.split(',').map(Number);
   state.signal = { r, c };
   state.path = [{ r, c }];
-  resetMomentum();
+  resetMomentum();     // in TRACE mode this is the combo boundary; in MOVE mode it only
+                       // happens once, at combat start
   state.phase = 'moving';
   log('sys','— signal live on '+PROGRAMS[state.programs[k]].name+' —');
   activateTile(k);   // the tile it lands on fires like any other
@@ -704,6 +727,9 @@ function edgeKey(a,b){
 function activateTile(k){
   const p = PROGRAMS[state.programs[k]];
   if(!p) { firingCell = null; return; }
+  // In TRACE mode only the on-arm programs pay out as you pass; the rest wait for the
+  // chain. In MOVE mode everything fires here.
+  if(isTrace() && p.resolveOn !== 'arm') return;
   firingCell = k;                 // highlight the tile that just paid out
   p.resolve(PROGRAM_API, k);
 }
@@ -915,7 +941,9 @@ function dealToPlayer(amt, src){
   // COMBO SHIELD changes the price from "all of it" to a fixed toll, so a long combo
   // survives a hit it would otherwise have ended. It never drops below the HEAD START
   // floor, so the two powers stack the way the player would expect.
-  if(dmg > 0){
+  // MOVE mode: a landed hit costs momentum. TRACE mode keeps the original rule, where
+  // the commit is the boundary and a hit does not touch the combo.
+  if(dmg > 0 && !isTrace()){
     const toll = powerVal('comboShield');
     if(toll){
       const floor = powerVal('startCombo');
@@ -936,6 +964,49 @@ function checkPlayerDead(){
     banner('💀 SYSTEM BREACHED', '#ef4444');
     log('lose','You died.');
   }
+}
+
+// ---------- Backward chain (TRACE mode only) ----------
+// SPACE commits: the armed path replays in reverse, firing each on-trace program as the
+// chain reaches it. Then cooldowns take one free tick (the chain is not free) and a
+// fresh signal spawns, which is what resets combo in this mode.
+function fireChain(){
+  if(!isTrace() || state.phase!=='moving' || state.over) return;
+  state.phase='activating';
+  const reversed = state.path.slice().reverse();
+  log('sys','▶ tracing back '+reversed.length+' steps…');
+  let i=0;
+  const step = ()=>{
+    if(state.over) return;
+    if(i>=reversed.length){ endChain(); return; }
+    const {r,c} = reversed[i];
+    const k = key(r,c);
+    firingCell = k;
+    const p = PROGRAMS[state.programs[k]];
+    if(p && p.resolveOn === 'trace') p.resolve(PROGRAM_API, k);
+    i++;
+    render(true);
+    setTimeout(step, CHAIN_STEP_MS);
+  };
+  step();
+}
+
+function endChain(){
+  firingCell = null;
+  if(state.enemies.every(e=>!e.alive)){
+    if(state.wave < state.maxWaves){ startWave(state.wave + 1); spawnSignal(); return; }
+    state.over=true; state.phase='over';
+    banner('✓ ALL WAVES CLEARED', '#22c55e');
+    log('win','You win!');
+    render(); return;
+  }
+  if(state.over){ render(); return; }
+  // Firing the chain costs a turn of its own, so committing is never free.
+  log('sys','chain resolved · cooldowns advance 1');
+  state.enemies.forEach(e=>{ if(e.alive) e.abilities.forEach(i => tickAbility(e, i, false)); });
+  checkPlayerDead();
+  if(state.over){ render(); return; }
+  spawnSignal();
 }
 
 // ---------- Wave / victory ----------
@@ -1128,11 +1199,23 @@ window.addEventListener('keydown',(e)=>{
   else if(k==='arrowleft'||k==='a'){ tryMove(0,-1); e.preventDefault(); }
   else if(k==='arrowright'||k==='d'){ tryMove(0,1); e.preventDefault(); }
   else if(k===' '){
-    if(state.phase==='setup') beginCombat();   // SPACE only starts the fight now —
-    e.preventDefault();                        // every step commits itself
-
+    // Starts the fight from setup; in TRACE mode it also commits the armed chain. In
+    // MOVE mode there is nothing to commit — every step commits itself.
+    if(state.phase==='setup') beginCombat();
+    else if(isTrace()) fireChain();
+    e.preventDefault();
   }
   else if(k==='enter'){ if(state.phase==='setup') beginCombat(); }
+});
+// The mode is a SETUP choice: picking it mid-fight would change the rules under a board
+// the player built for the other one, so the control locks the moment combat starts.
+document.getElementById('modeSel').addEventListener('change', (e)=>{
+  if(state.phase!=='setup') return;
+  comboMode = e.target.value;
+  state.mode = comboMode;
+  log('sys','mode → '+(comboMode==='trace' ? 'COMMIT + TRACEBACK (SPACE fires the chain)'
+                                           : 'MOVE-ACTIVATE (each step fires its tile)'));
+  render();
 });
 document.getElementById('reset').addEventListener('click', start);
 document.getElementById('startBtn').addEventListener('click', beginCombat);
@@ -1243,6 +1326,9 @@ function buildPowerRows(){
 
 function updateToolState(){
   const setup = state.phase==='setup' && !state.over;
+  const modeSel = document.getElementById('modeSel');
+  modeSel.value = state.mode;
+  modeSel.disabled = !setup;   // locked for the duration of the fight
   document.getElementById('addProgSel').disabled = !setup;
   document.getElementById('addProgBtn').disabled = !setup;
   const canEnemy = !state.over;
