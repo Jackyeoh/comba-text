@@ -556,11 +556,11 @@ const ABILITIES = {
 // Enemy roster — stats + which ability instances the enemy fields.
 const ENEMY_DEFS = {
   gnat:   { name:'GNAT',   hp:45, abilities:[{ kind:'strike',  cd:2,  dmg:3 }] },
-  daemon: { name:'DAEMON', hp:70, abilities:[{ kind:'strike',  cd:5,  dmg:6 }] },  // the original enemy
+  daemon: { name:'DAEMON', hp:65, abilities:[{ kind:'strike',  cd:5,  dmg:6 }] },  // the original enemy
   warden: { name:'WARDEN', hp:80, abilities:[{ kind:'wall',    cd:3, dmg:3 }] },
-  siege:  { name:'SIEGE',  hp:80, abilities:[{ kind:'ramp',    cd:12, dmg:8 }] },
-  blight: { name:'BLIGHT', hp:60, abilities:[{ kind:'corrupt', cd:8 }] },
-  ember:  { name:'EMBER',  hp:60, abilities:[{ kind:'burn',    cd:4 }] },
+  siege:  { name:'SIEGE',  hp:70, abilities:[{ kind:'ramp',    cd:12, dmg:8 }] },
+  blight: { name:'BLIGHT', hp:55, abilities:[{ kind:'corrupt', cd:8 }] },
+  ember:  { name:'EMBER',  hp:50, abilities:[{ kind:'burn',    cd:4 }] },
   bomber: { name:'BOMBER', hp:35, abilities:[{ kind:'bomb',    cd:7 }] },
 };
 const WAVE_COUNT = 3, WAVE_SIZE = 3;   // 3 waves of 3 enemies rolled from the roster
