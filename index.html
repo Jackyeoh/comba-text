@@ -286,7 +286,7 @@
             <b>Move-activate:</b> each step fires the tile you land on — "on arm" and "on commit" alike. A landed hit clears your combo.<br>
             <b>Commit + traceback:</b> stepping ARMS programs — "on arm" ones pay out as you pass, "on commit" ones wait. <b>SPACE</b> fires the armed chain in reverse; the signal then respawns and combo resets.<br>
             Each move = +1 combo (+10% signal strength). Moving decrements enemy cooldowns. Orange bars are walls.<br>
-            <b>From move 20, the enemy gains +20% power every 10 moves</b> — stalling is not a strategy.<br>
+            <b>From move 30, the enemy gains +20% power every 10 moves</b> — stalling is not a strategy.<br>
             Block charges are listed separately with their own countdowns — two grants expire a move apart, not together.<br>
             <b>Any damage that gets through resets your combo</b> — blocked damage does not, so GUARD protects the streak as well as the health.<br>
             <b>POWERS</b> below are toggle-able run modifiers; they persist across Reset so two runs can be compared on the same picks.
@@ -373,7 +373,7 @@
 <script>
 // ---------- Config ----------
 const GRID = 5;                  // board is GRID x GRID; the CSS grid is driven off this
-const STRIKE_DMG = 10, GUARD_BLOCK = 3, COMBO_GAIN = 3, DELAY_CD = 2;
+const STRIKE_DMG = 10, GUARD_BLOCK = 6, COMBO_GAIN = 3, DELAY_CD = 2;
 const CSTRIKE_BASE = 8, CSTRIKE_RAMP = 3, EMPOWER_PCT = 0.30, BURN_DMG = 3;
 // Corruption: a STAGED, growing debuff rather than a flat one.
 //   seeded (half-filled tile, 1 stack) → next move it takes hold (full tile, 2 stacks)
@@ -387,7 +387,7 @@ const CORRUPT_GROW_TURNS   = 2;    // moves between stacks once a tile is fully 
 // strategy. Counted in PLAYER MOVES, like everything else on the clock.
 const ESCALATE_START = 30;         // moves before the FIRST escalation
 const ESCALATE_EVERY = 10;         // moves between escalations after that
-const ESCALATE_PCT   = 0.20;       // enemy power gained per escalation
+const ESCALATE_PCT   = 0.10;       // enemy power gained per escalation
 // Block is banked in CHARGES, each with its own short life, so shielding is something
 // you spend on the turn you need it rather than a pool you hoard across the fight.
 const BLOCK_TURNS_DEFAULT = 3;     // player moves a banked block charge survives
