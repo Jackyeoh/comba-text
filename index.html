@@ -1354,6 +1354,7 @@ function render(keepFiring){
     const type = state.programs[k];
     if(type){ t.classList.add('prog', type);
       t.innerHTML='<span class="abbr">'+PROGRAMS[type].abbr+'</span>';
+      t.title = programTooltip(type, k);
       if(armCount[k]) t.innerHTML+='<span class="arms">×'+armCount[k]+'</span>';
       if(state.relays[k]?.charges) t.innerHTML+='<span class="relaybadge">⟳'+state.relays[k].charges+'</span>';
       if(state.dormant[k]){ t.classList.add('dormant'); t.innerHTML+='<span class="dormbadge">z'+state.dormant[k]+'</span>'; }
@@ -1460,6 +1461,28 @@ function render(keepFiring){
     enemiesEl.appendChild(d);
   });
   updateToolState();
+}
+
+/**
+ * Hover text for a program tile: what it is, what it does, and — because the two modes
+ * disagree about it — WHEN it fires. A tile shows only a three-letter abbreviation, so
+ * without this the board is unreadable until you have memorised the set.
+ *
+ * Live state is appended when there is any, so a dormant or relay-driven tile explains
+ * its own badge rather than leaving the player to guess what "z2" or "⟳3" meant.
+ */
+function programTooltip(type, k){
+  const p = PROGRAMS[type];
+  const when = isTrace()
+    ? (p.resolveOn === 'arm' ? 'fires as you pass' : 'fires on COMMIT')
+    : 'fires when you step on it';
+  const bits = [p.name + ' — ' + p.desc, '(' + when + ')'];
+  if(state.dormant[k])        bits.push('DORMANT for ' + state.dormant[k] + ' more move(s)');
+  if(state.relays[k]?.charges) bits.push('driving a neighbour for ' + state.relays[k].charges + ' more move(s)');
+  const rot = state.corrupt.get(k);
+  if(rot)                     bits.push('corrupted: -' + Math.round(DEBUFF_PER_STACK*rot.stacks*100) + '% output');
+  if(state.empower[k])        bits.push('empowered: +' + Math.round(EMPOWER_PCT*state.empower[k]*100) + '%');
+  return bits.join(String.fromCharCode(10));   // newline-separated: the native tooltip honours it
 }
 
 function log(cls,msg){
