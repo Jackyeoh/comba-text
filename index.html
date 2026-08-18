@@ -77,6 +77,10 @@
   .tile.prog.empower { color: #4ade80; }
   .tile.prog.relay   { color: #a78bfa; }
   .tile.prog.aegis   { color: #38bdf8; }
+  .tile.prog.ward    { color: #86efac; }
+  .tile.prog.surge   { color: #fbbf24; }
+  /* Board-wide surge: every program glows while it is live. */
+  .tile.prog.surged { box-shadow: inset 0 0 0 2px rgba(251,191,36,.85); }
   /* Dormant: the tile is still there, it just cannot answer yet. */
   .tile.dormant { filter: grayscale(.8) brightness(.55); }
   .tile .dormbadge { position:absolute; top:2px; left:3px; font-size:10px; color:#94a3b8; }
@@ -181,6 +185,7 @@
   .stat-row { display:flex; justify-content:space-between; }
   .strength { color:#22d3ee; font-weight: bold; }
   .escalation { color:#f87171; font-weight: bold; }
+  .surge-val  { color:#fbbf24; font-weight: bold; }
 
   .log {
     background:#0e1621; border:1px solid #1f2937; padding:8px;
@@ -252,6 +257,9 @@
           </div>
           <div class="stat-row"><span>Next escalation in</span><span id="escNextText"></span></div>
           <div class="stat-row"><span>Moves taken</span><span id="movesText">0</span></div>
+          <div class="stat-row" id="surgeRow" style="display:none">
+            <span>Program output</span><span class="surge-val" id="surgeText"></span>
+          </div>
         </div>
 
         <div class="panel">
@@ -349,7 +357,7 @@
 <script>
 // ---------- Config ----------
 const GRID = 5;                  // board is GRID x GRID; the CSS grid is driven off this
-const STRIKE_DMG = 10, GUARD_BLOCK = 10, COMBO_GAIN = 3, DELAY_CD = 2;
+const STRIKE_DMG = 10, GUARD_BLOCK = 6, COMBO_GAIN = 3, DELAY_CD = 2;
 const CSTRIKE_BASE = 8, CSTRIKE_RAMP = 3, EMPOWER_PCT = 0.30, BURN_DMG = 3;
 // Corruption: a STAGED, growing debuff rather than a flat one.
 //   seeded (half-filled tile, 1 stack) → next move it takes hold (full tile, 2 stacks)
@@ -361,14 +369,17 @@ const CORRUPT_SPREAD_EVERY = 2;    // player moves between one spread and the ne
 const CORRUPT_GROW_TURNS   = 2;    // moves between stacks once a tile is fully corrupted
 // Escalation: the fight gets worse the longer it runs, so a stalemate is never a
 // strategy. Counted in PLAYER MOVES, like everything else on the clock.
-const ESCALATE_START = 20;         // moves before the FIRST escalation
+const ESCALATE_START = 30;         // moves before the FIRST escalation
 const ESCALATE_EVERY = 10;         // moves between escalations after that
 const ESCALATE_PCT   = 0.20;       // enemy power gained per escalation
 // Block is banked in CHARGES, each with its own short life, so shielding is something
 // you spend on the turn you need it rather than a pool you hoard across the fight.
 const BLOCK_TURNS_DEFAULT = 3;     // player moves a banked block charge survives
-const AEGIS_MULT    = 3;           // AEGIS banks this many times GUARD's block…
+const AEGIS_MULT    = 2.5;           // AEGIS banks this many times GUARD's block…
 const AEGIS_DORMANT = 2;           // …then cannot fire again for this many moves
+const WARD_BLOCK  = 2;             // WARD's trickle of block, paid on the pass
+const SURGE_PCT   = 0.30;          // SURGE's board-wide output bonus…
+const SURGE_TURNS = 1;             // …and how many moves it lasts
 const CHAIN_STEP_MS = 260;         // pace the backward chain resolves at, in TRACE mode
 // RELAY: activating it starts a RUN of N moves (N = base, +1 per RELAY_PER_COMBO combo
 // held when it fires). On each of those moves it activates ONE random adjacent program.
@@ -459,6 +470,10 @@ const PROGRAMS = {
              resolve:(api,k)=> api.addBlock(GUARD_BLOCK, 'GUARD', k) },
   aegis:   { abbr:'AEG', name:'AEGIS',    desc:'gain 3x GUARD block, then dormant for 2 moves', resolveOn:'trace',
              resolve:(api,k)=> api.aegis(k) },
+  ward:    { abbr:'WRD', name:'WARD',     desc:'on arm: +2 block. Does nothing on activate.', resolveOn:'arm',
+             resolve:(api,k)=> api.addBlock(WARD_BLOCK, 'WARD', k) },
+  surge:   { abbr:'SRG', name:'SURGE',    desc:'on arm: +30% output to EVERY program on the board for 1 move', resolveOn:'arm',
+             resolve:(api,k)=> api.surge() },
   combo:   { abbr:'CMB', name:'COMBO',    desc:'+3 combo', resolveOn:'arm',
              resolve:(api,k)=> api.addCombo(COMBO_GAIN) },
   delay:   { abbr:'DLY', name:'DELAY',    desc:'+2 cd to a random enemy ability', resolveOn:'arm',
@@ -624,7 +639,7 @@ function newState(){
   // Two GUARDs are guaranteed: with block expiring after blockTurns moves, a single one
   // cannot keep a shield up often enough for defending to be a live option at all.
   const bag = ['strike','guard','guard'];
-  const pool = ['strike','cstrike','guard','aegis','combo','delay','empower','relay'];
+  const pool = ['strike','cstrike','guard','aegis','ward','surge','combo','delay','empower','relay'];
   // Snapshot the shortfall BEFORE filling: `bag.length` grows with every push, so
   // re-reading it in the loop condition stops the fill halfway (that bug shipped as a
   // 5-program board when PROGRAM_COUNT said 7).
@@ -661,6 +676,7 @@ function newState(){
     // `counts` is how many times it has driven each neighbour, which drives the pick.
     relays: {},
     dormant: {},             // cellKey -> moves until the program can fire again (AEGIS)
+    surge: 0,                // moves left on SURGE's board-wide output bonus
     corruptSpreadTimer: 0,   // moves since the last spread
     totalMoves: 0,           // every successful move this combat — always counts
     movesTaken: 0,           // moves on the ESCALATION clock (frozen while it is off)
@@ -677,6 +693,9 @@ function newState(){
 }
 
 // The one place combo becomes damage. COMBO BONUS raises what each point is worth.
+/** SURGE's board-wide output multiplier — 1 when it is not running. */
+function surgeMult(){ return state.surge > 0 ? (1 + SURGE_PCT) : 1; }
+
 /** Total block currently standing. */
 function blockTotal(){ return state.player.blocks.reduce((n,b)=>n+b.amount, 0); }
 
@@ -853,18 +872,26 @@ const PROGRAM_API = {
   dealDamage(base, label, k){
     const emp = 1 + EMPOWER_PCT * (state.empower[k] || 0);
     const deb = corruptMult(k);
-    dealStrike(base * emp * deb * strengthMult(), label, emp, deb);
+    dealStrike(base * emp * deb * surgeMult() * strengthMult(), label, emp, deb);
   },
   /** AEGIS: a big shield, paid for with downtime rather than with a step. */
   aegis(k){
     const deb = corruptMult(k);
-    const blk = bankBlock(GUARD_BLOCK * AEGIS_MULT * deb * strengthMult());
+    const blk = bankBlock(GUARD_BLOCK * AEGIS_MULT * deb * surgeMult() * strengthMult());
     state.dormant[k] = AEGIS_DORMANT + 1;   // +1: this move's tick spends one
     log('blk','AEGIS → +' + blk + ' block, dormant ' + AEGIS_DORMANT + ' moves');
   },
+  /** SURGE: lift every program on the board for a move. */
+  surge(){
+    // +1 because this move's own end-of-turn tick will spend one — so SURGE_TURNS is
+    // the number of moves that actually benefit, which is what the card promises.
+    state.surge = SURGE_TURNS + 1;
+    log('cmb','SURGE → +' + Math.round(SURGE_PCT*100) + '% output to all programs for '
+      + SURGE_TURNS + ' move' + (SURGE_TURNS>1?'s':''));
+  },
   addBlock(base, label, k){
     const deb = corruptMult(k);
-    const blk = bankBlock(base * deb * strengthMult());
+    const blk = bankBlock(base * deb * surgeMult() * strengthMult());
     log('blk', label + ' → +' + blk + ' block (' + Math.round(strengthMult()*100) + '%' + (deb<1?' ·-20%':'') + ')');
   },
   addCombo(n){
@@ -944,6 +971,7 @@ function enemyTick(){
   tickCorruption();                   // rot matures, and spreads every other move
   decayWalls();                       // walls are temporary — they stand for WALL_TURNS moves
   tickDormant();                      // dormant programs wake up
+  if(state.surge > 0 && --state.surge === 0) log('cmb','◇ SURGE faded');
   tickBlock();                        // banked block ages out after blockTurns moves
   tickEscalation();                   // the fight itself gets harder the longer it runs
   checkPlayerDead();
@@ -1329,6 +1357,7 @@ function render(keepFiring){
       if(armCount[k]) t.innerHTML+='<span class="arms">×'+armCount[k]+'</span>';
       if(state.relays[k]?.charges) t.innerHTML+='<span class="relaybadge">⟳'+state.relays[k].charges+'</span>';
       if(state.dormant[k]){ t.classList.add('dormant'); t.innerHTML+='<span class="dormbadge">z'+state.dormant[k]+'</span>'; }
+      if(state.surge > 0) t.classList.add('surged');
       if(state.empower[k]){ t.classList.add('empowered'); t.innerHTML+='<span class="empbadge">+'+Math.round(EMPOWER_PCT*state.empower[k]*100)+'%</span>'; }
       if(canRearrange()){ t.classList.add('draggable'); t.draggable=true; }
     }
@@ -1387,6 +1416,10 @@ function render(keepFiring){
       ? (ESCALATE_START - state.movesTaken) + ' moves'
       : (ESCALATE_EVERY - ((state.movesTaken - ESCALATE_START) % ESCALATE_EVERY)) + ' moves';
   document.getElementById('movesText').textContent = state.totalMoves;
+  const surgeRow = document.getElementById('surgeRow');
+  surgeRow.style.display = state.surge > 0 ? 'flex' : 'none';
+  document.getElementById('surgeText').textContent =
+    '+' + Math.round(SURGE_PCT*100) + '% (' + state.surge + ')';
 
   // Expiry cue — played once, after the turn is fully resolved.
   if(blockExpired){
