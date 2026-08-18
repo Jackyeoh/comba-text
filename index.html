@@ -48,8 +48,8 @@
   /* Board */
   .board {
     display: grid;
-    grid-template-columns: repeat(5, 64px);
-    grid-template-rows: repeat(5, 64px);
+    grid-template-columns: repeat(var(--grid), 64px);
+    grid-template-rows: repeat(var(--grid), 64px);
     gap: 4px;
     background: #111827;
     padding: 6px;
@@ -229,15 +229,15 @@
             <b>Move-activate:</b> each step fires the tile you land on, and a landed hit clears your combo.<br>
             <b>Commit + traceback:</b> stepping ARMS programs, <b>SPACE</b> fires the armed chain in reverse, then the signal respawns and combo resets — a hit does not clear it.<br>
             Each move = +1 combo (+10% signal strength). Moving decrements enemy cooldowns. Orange bars are walls.<br>
-            <b>From move 15, the enemy gains +20% power every 5 moves</b> — stalling is not a strategy.<br>
+            <b>From move 20, the enemy gains +20% power every 10 moves</b> — stalling is not a strategy.<br>
             <b>Any damage that gets through resets your combo</b> — blocked damage does not, so GUARD protects the streak as well as the health.<br>
             <b>POWERS</b> below are toggle-able run modifiers; they persist across Reset so two runs can be compared on the same picks.
           </div>
           <div class="tool-row" id="modeRow" style="margin-bottom:8px;">
             <label>Mode</label>
             <select id="modeSel">
-              <option value="move">Move-activate</option>
               <option value="trace">Commit + traceback</option>
+              <option value="move">Move-activate</option>
             </select>
           </div>
           <button id="startBtn">▶ Start combat</button>
@@ -272,7 +272,7 @@
               <label>Escalation</label>
               <input type="checkbox" id="escToggle" checked>
               <span style="color:#64748b;font-size:11px;flex:1;">
-                +20% enemy power from move 15, then every 5. Off freezes the clock rather than resetting it.
+                +20% enemy power from move 20, then every 10. Off freezes the clock rather than resetting it.
               </span>
             </div>
             <div style="color:#64748b;font-size:11px;margin-bottom:4px;">
@@ -314,7 +314,7 @@
 
 <script>
 // ---------- Config ----------
-const GRID = 5;
+const GRID = 5;                  // board is GRID x GRID; the CSS grid is driven off this
 const STRIKE_DMG = 10, GUARD_BLOCK = 10, COMBO_GAIN = 3, DELAY_CD = 2;
 const CSTRIKE_BASE = 8, CSTRIKE_RAMP = 3, EMPOWER_PCT = 0.30, BURN_DMG = 3;
 // Corruption: a STAGED, growing debuff rather than a flat one.
@@ -327,8 +327,8 @@ const CORRUPT_SPREAD_EVERY = 2;    // player moves between one spread and the ne
 const CORRUPT_GROW_TURNS   = 2;    // moves between stacks once a tile is fully corrupted
 // Escalation: the fight gets worse the longer it runs, so a stalemate is never a
 // strategy. Counted in PLAYER MOVES, like everything else on the clock.
-const ESCALATE_START = 15;         // moves before the FIRST escalation
-const ESCALATE_EVERY = 5;          // moves between escalations after that
+const ESCALATE_START = 20;         // moves before the FIRST escalation
+const ESCALATE_EVERY = 10;         // moves between escalations after that
 const ESCALATE_PCT   = 0.20;       // enemy power gained per escalation
 // Block is banked in CHARGES, each with its own short life, so shielding is something
 // you spend on the turn you need it rather than a pool you hoard across the fight.
@@ -347,7 +347,7 @@ const RELAY_PER_COMBO  = 5;        // +1 more move for every this much combo whe
 //   'trace' — the original: stepping ARMS programs, SPACE fires the armed chain in
 //             reverse, then the signal respawns and combo resets with it. A hit does
 //             not clear combo here — the commit is the boundary.
-let comboMode = 'move';
+let comboMode = 'trace';
 function isTrace(){ return (state?.mode ?? comboMode) === 'trace'; }
 const BOMB_HIT = 20, BOMB_MISS = 7;    // -33% across the board
 const EMPOWER_MAX = 5;           // stacks one tile can hold — caps the +30%/stack ramp
@@ -583,7 +583,11 @@ function newState(){
   // cannot keep a shield up often enough for defending to be a live option at all.
   const bag = ['strike','guard','guard'];
   const pool = ['strike','cstrike','guard','combo','delay','empower','relay'];
-  for(let i=0;i<PROGRAM_COUNT-bag.length;i++) bag.push(pool[rand(pool.length)]);
+  // Snapshot the shortfall BEFORE filling: `bag.length` grows with every push, so
+  // re-reading it in the loop condition stops the fill halfway (that bug shipped as a
+  // 5-program board when PROGRAM_COUNT said 7).
+  const fill = PROGRAM_COUNT - bag.length;
+  for(let i=0;i<fill;i++) bag.push(pool[rand(pool.length)]);
   // ensure at least the required ones present (they are)
   // cluster placement: pick a center, take the nearest N tiles so programs
   // sit in a compact group (the signal later spawns on one of them).
@@ -1490,6 +1494,9 @@ function updateToolState(){
 }
 
 function start(){
+  // The board's CSS grid is sized from GRID, so the layout follows the constant instead
+  // of a hard-coded number that has to be remembered separately.
+  boardEl.style.setProperty('--grid', GRID);
   state = newState();
   buildPowerRows();
   wireEnemyDials();
