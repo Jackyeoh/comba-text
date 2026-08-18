@@ -216,6 +216,7 @@
             <span>Enemy power</span><span class="escalation" id="escText"></span>
           </div>
           <div class="stat-row"><span>Next escalation in</span><span id="escNextText"></span></div>
+          <div class="stat-row"><span>Moves taken</span><span id="movesText">0</span></div>
         </div>
 
         <div class="panel">
@@ -264,6 +265,13 @@
               <label>Enemy ATK</label>
               <input type="range" id="atkScale" min="10" max="1000" step="10" value="100">
               <span class="scale-val" id="atkScaleVal">100%</span>
+            </div>
+            <div class="tool-row">
+              <label>Escalation</label>
+              <input type="checkbox" id="escToggle" checked>
+              <span style="color:#64748b;font-size:11px;flex:1;">
+                +20% enemy power every 5 moves. Off freezes the clock rather than resetting it.
+              </span>
             </div>
             <div style="color:#64748b;font-size:11px;margin-bottom:4px;">
               Applies live — HP keeps its fraction, so a wounded enemy stays wounded. Also
@@ -529,6 +537,10 @@ let powerSel = { comboBonus:0, startCombo:0, startGuard:0, comboShield:0, moment
 // outside state, so a reset re-rolls the fight at the SAME difficulty — otherwise the
 // sliders would be useless for comparing two runs.
 let enemyScale = { hp: 1, atk: 1 };
+// Escalation can be switched off to study a fight without the clock on it. While off the
+// escalation counter FREEZES rather than resetting, so switching it back on resumes from
+// where the fight left off instead of handing the player a free reprieve.
+let escalationOn = true;
 // Everything that hurts the player is scaled here — ability damage, bombs, burn — so the
 // debug dial and the fight's own escalation compose in ONE place rather than each source
 // remembering to apply both.
@@ -536,9 +548,11 @@ function atkMult(){ return enemyScale.atk * (1 + ESCALATE_PCT * (state?.escalati
 
 function newState(){
   // place programs: 1 strike, 1 guard, rest random
-  const bag = ['strike','guard'];
+  // Two GUARDs are guaranteed: with block expiring after BLOCK_TURNS, a single one
+  // cannot keep a shield up often enough for defending to be a live option at all.
+  const bag = ['strike','guard','guard'];
   const pool = ['strike','cstrike','guard','combo','delay','empower'];
-  for(let i=0;i<PROGRAM_COUNT-2;i++) bag.push(pool[rand(pool.length)]);
+  for(let i=0;i<PROGRAM_COUNT-bag.length;i++) bag.push(pool[rand(pool.length)]);
   // ensure at least the required ones present (they are)
   // cluster placement: pick a center, take the nearest N tiles so programs
   // sit in a compact group (the signal later spawns on one of them).
@@ -567,7 +581,8 @@ function newState(){
     // tileKey -> { stacks, full, timer } — BLIGHT's rot. See DEBUFF_PER_STACK.
     corrupt: new Map(),
     corruptSpreadTimer: 0,   // moves since the last spread
-    movesTaken: 0,           // successful moves this combat (drives escalation)
+    totalMoves: 0,           // every successful move this combat — always counts
+    movesTaken: 0,           // moves on the ESCALATION clock (frozen while it is off)
     escalation: 0,           // +ESCALATE_PCT enemy power per stack
     burn: new Map(),     // tileKey -> burn stacks (EMBER); stacks × 1 dmg on step-in
     empower: {},         // tileKey -> empower stacks, cleared when you take a hit
@@ -809,6 +824,8 @@ function enemyTick(){
 // multiplier the ATK dial uses, then pushed onto live enemies so the numbers on their
 // cards move with it — an escalation the player cannot see is just unexplained damage.
 function tickEscalation(){
+  state.totalMoves++;
+  if(!escalationOn) return;      // clock frozen — the elapsed turn is not counted
   if(++state.movesTaken % ESCALATE_EVERY !== 0) return;
   state.escalation++;
   applyEnemyScaling();
@@ -1149,8 +1166,10 @@ function render(keepFiring){
   escRow.style.display = state.escalation ? 'flex' : 'none';
   document.getElementById('escText').textContent =
     '+' + Math.round(ESCALATE_PCT * state.escalation * 100) + '%';
-  document.getElementById('escNextText').textContent =
-    (ESCALATE_EVERY - (state.movesTaken % ESCALATE_EVERY)) + ' moves';
+  document.getElementById('escNextText').textContent = escalationOn
+    ? (ESCALATE_EVERY - (state.movesTaken % ESCALATE_EVERY)) + ' moves'
+    : 'paused';
+  document.getElementById('movesText').textContent = state.totalMoves;
 
   // Floating readout over the board — the same two numbers, where the player is looking.
   const hud = document.getElementById('comboHud');
@@ -1261,6 +1280,14 @@ function addEnemy(type){
 // Two multipliers over the roster's authored numbers, 10%..1000%. They re-apply to the
 // live board on every input so the effect is felt while dragging, not on the next wave.
 function wireEnemyDials(){
+  const esc = document.getElementById('escToggle');
+  esc.checked = escalationOn;
+  esc.addEventListener('change', ()=>{
+    escalationOn = esc.checked;
+    log('sys','escalation '+(escalationOn ? 'resumed at ×'+(state.escalation||0) : 'paused'));
+    render(true);
+  });
+
   [['hp','hpScale','hpScaleVal'], ['atk','atkScale','atkScaleVal']].forEach(([field, id, valId])=>{
     const el = document.getElementById(id), out = document.getElementById(valId);
     el.value = Math.round(enemyScale[field] * 100);
