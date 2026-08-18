@@ -297,6 +297,9 @@ const CORRUPT_GROW_TURNS   = 2;    // moves between stacks once a tile is fully 
 // strategy. Counted in PLAYER MOVES, like everything else on the clock.
 const ESCALATE_EVERY = 5;          // moves between escalations
 const ESCALATE_PCT   = 0.20;       // enemy power gained per escalation
+// Block is banked in CHARGES, each with its own short life, so shielding is something
+// you spend on the turn you need it rather than a pool you hoard across the fight.
+const BLOCK_TURNS = 2;             // player moves a banked block charge survives
 const BOMB_HIT = 20, BOMB_MISS = 7;    // -33% across the board
 const EMPOWER_MAX = 5;           // stacks one tile can hold — caps the +30%/stack ramp
 const TRAIL_MAX = 8;             // how many steps of tail the board shows behind the signal
@@ -324,7 +327,7 @@ const POWERS = {
   },
   startGuard: {
     name: 'OPENING GUARD',
-    desc: t => 'gain ' + t + ' block whenever a combo starts',
+    desc: t => 'gain ' + t + ' block whenever a combo starts (lasts 2 turns)',
     tiers: [5, 10, 15],
     tierLabel: t => String(t),
   },
@@ -362,7 +365,7 @@ const PROGRAMS = {
              resolve:(api,k)=> api.dealDamage(STRIKE_DMG, 'STRIKE', k) },
   cstrike: { abbr:'CST', name:'C-STRIKE', desc:'deal 8 dmg, +3 per C-STRIKE since your last hit',
              resolve:(api,k)=>{ const base = api.cstrikeRamp(); api.dealDamage(base, 'C-STRIKE(base '+base+')', k); } },
-  guard:   { abbr:'GRD', name:'GUARD',    desc:'gain 5 block',
+  guard:   { abbr:'GRD', name:'GUARD',    desc:'gain 5 block (lasts 2 turns)',
              resolve:(api,k)=> api.addBlock(GUARD_BLOCK, 'GUARD', k) },
   combo:   { abbr:'CMB', name:'COMBO',    desc:'+3 combo',
              resolve:(api,k)=> api.addCombo(COMBO_GAIN) },
@@ -534,7 +537,8 @@ function newState(){
   return {
     programs, enemies, nextEnemyId: enemies.length,
     wave: 1, maxWaves: WAVE_COUNT,
-    player: { hp:100, maxHp:100, block:0 },
+    // blocks: [{ amount, turns }] — each charge expires on its own clock (BLOCK_TURNS).
+    player: { hp:100, maxHp:100, blocks: [] },
     combo: 0,
     signal: null,        // {r,c}
     path: [],            // [{r,c}] visited in order (arm sequence source)
@@ -555,6 +559,42 @@ function newState(){
 }
 
 // The one place combo becomes damage. COMBO BONUS raises what each point is worth.
+/** Total block currently standing. */
+function blockTotal(){ return state.player.blocks.reduce((n,b)=>n+b.amount, 0); }
+
+/** Bank a charge with a fresh life. */
+function bankBlock(amount){
+  const amt = Math.round(amount);
+  if(amt > 0) state.player.blocks.push({ amount: amt, turns: BLOCK_TURNS });
+  return amt;
+}
+
+/**
+ * Spend block against incoming damage, soonest-to-expire FIRST — a charge that is about
+ * to vanish is worth nothing held back, so this is both the intuitive order and the one
+ * that wastes the least.
+ */
+function spendBlock(dmg){
+  let left = dmg, used = 0;
+  state.player.blocks.sort((a,b)=>a.turns-b.turns);
+  for(const b of state.player.blocks){
+    if(left <= 0) break;
+    const take = Math.min(b.amount, left);
+    b.amount -= take; left -= take; used += take;
+  }
+  state.player.blocks = state.player.blocks.filter(b=>b.amount > 0);
+  return used;
+}
+
+/** Age every charge one player move; drop the spent ones. */
+function tickBlock(){
+  if(!state.player.blocks.length) return;
+  let lost = 0;
+  state.player.blocks.forEach(b=>{ if(--b.turns <= 0) lost += b.amount; });
+  state.player.blocks = state.player.blocks.filter(b=>b.turns > 0);
+  if(lost) log('blk','◇ '+lost+' block expired');
+}
+
 function strengthMult(){ return 1 + (0.1 + powerVal('comboBonus')) * state.combo; }
 
 // ---------- Targeting ----------
@@ -607,7 +647,7 @@ function resetMomentum(){
   state.cstrikeCount = 0;
   const guard = powerVal('startGuard');
   if(guard){
-    state.player.block += guard;
+    bankBlock(guard);
     log('blk','OPENING GUARD → +' + guard + ' block');
   }
   if(state.combo) log('cmb','HEAD START → combo opens at ' + state.combo);
@@ -678,8 +718,7 @@ const PROGRAM_API = {
   },
   addBlock(base, label, k){
     const deb = corruptMult(k);
-    const blk = Math.round(base * deb * strengthMult());
-    state.player.block += blk;
+    const blk = bankBlock(base * deb * strengthMult());
     log('blk', label + ' → +' + blk + ' block (' + Math.round(strengthMult()*100) + '%' + (deb<1?' ·-20%':'') + ')');
   },
   addCombo(n){
@@ -735,6 +774,7 @@ function enemyTick(){
   state.enemies.forEach(e=>{ if(e.alive) e.abilities.forEach(i => tickAbility(e, i, true)); });
   tickCorruption();                   // rot matures, and spreads every other move
   decayWalls();                       // walls are temporary — they stand for WALL_TURNS moves
+  tickBlock();                        // banked block ages out after BLOCK_TURNS moves
   tickEscalation();                   // the fight itself gets harder the longer it runs
   checkPlayerDead();
 }
@@ -860,9 +900,8 @@ function placeWall(e){
 
 function dealToPlayer(amt, src){
   let dmg = amt;
-  if(state.player.block>0){
-    const absorbed = Math.min(state.player.block, dmg);
-    state.player.block -= absorbed;
+  if(blockTotal()>0){
+    const absorbed = spendBlock(dmg);
     dmg -= absorbed;
     log('blk', src+' hits for '+amt+' ('+absorbed+' blocked)');
   } else {
@@ -927,7 +966,7 @@ function dealStrike(raw, label, emp, deb){
 // Roll a fresh wave of WAVE_SIZE enemies (dead ones stay in the roster, greyed).
 function startWave(n){
   state.wave = n;
-  state.player.block = 0;            // block does not carry between waves
+  state.player.blocks = [];          // block does not carry between waves
   for(let i=0;i<WAVE_SIZE;i++) state.enemies.push(makeEnemy(rollType(), state.nextEnemyId++));
   state.targetId = null;
   // new BLIGHTs auto-cast on wave entry (older waves are already dead)
@@ -1025,7 +1064,12 @@ function render(keepFiring){
   // player
   document.getElementById('hpText').textContent = state.player.hp+' / '+state.player.maxHp;
   document.getElementById('hpFill').style.width = (100*state.player.hp/state.player.maxHp)+'%';
-  document.getElementById('blockText').textContent = state.player.block>0 ? '🛡 '+state.player.block+' block' : '';
+  // Show the total plus how soon the next charge lapses, so a shield about to vanish is
+  // visible while there is still a turn left to use it.
+  const blkTotal = blockTotal();
+  const soonest = state.player.blocks.length ? Math.min(...state.player.blocks.map(b=>b.turns)) : 0;
+  document.getElementById('blockText').textContent =
+    blkTotal>0 ? '🛡 '+blkTotal+' block ('+soonest+' turn'+(soonest===1?'':'s')+' left)' : '';
   document.getElementById('comboText').textContent = state.combo;
   document.getElementById('strengthText').textContent = Math.round(strengthMult()*100)+'%';
   // Escalation: the standing enemy-power bonus, plus the countdown to the next one, so
