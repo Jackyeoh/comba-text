@@ -229,7 +229,7 @@
             <b>Move-activate:</b> each step fires the tile you land on, and a landed hit clears your combo.<br>
             <b>Commit + traceback:</b> stepping ARMS programs, <b>SPACE</b> fires the armed chain in reverse, then the signal respawns and combo resets — a hit does not clear it.<br>
             Each move = +1 combo (+10% signal strength). Moving decrements enemy cooldowns. Orange bars are walls.<br>
-            <b>Every 5 moves the enemy gains +20% power</b> — stalling is not a strategy.<br>
+            <b>From move 15, the enemy gains +20% power every 5 moves</b> — stalling is not a strategy.<br>
             <b>Any damage that gets through resets your combo</b> — blocked damage does not, so GUARD protects the streak as well as the health.<br>
             <b>POWERS</b> below are toggle-able run modifiers; they persist across Reset so two runs can be compared on the same picks.
           </div>
@@ -272,7 +272,7 @@
               <label>Escalation</label>
               <input type="checkbox" id="escToggle" checked>
               <span style="color:#64748b;font-size:11px;flex:1;">
-                +20% enemy power every 5 moves. Off freezes the clock rather than resetting it.
+                +20% enemy power from move 15, then every 5. Off freezes the clock rather than resetting it.
               </span>
             </div>
             <div style="color:#64748b;font-size:11px;margin-bottom:4px;">
@@ -314,7 +314,8 @@ const CORRUPT_SPREAD_EVERY = 2;    // player moves between one spread and the ne
 const CORRUPT_GROW_TURNS   = 2;    // moves between stacks once a tile is fully corrupted
 // Escalation: the fight gets worse the longer it runs, so a stalemate is never a
 // strategy. Counted in PLAYER MOVES, like everything else on the clock.
-const ESCALATE_EVERY = 5;          // moves between escalations
+const ESCALATE_START = 15;         // moves before the FIRST escalation
+const ESCALATE_EVERY = 5;          // moves between escalations after that
 const ESCALATE_PCT   = 0.20;       // enemy power gained per escalation
 // Block is banked in CHARGES, each with its own short life, so shielding is something
 // you spend on the turn you need it rather than a pool you hoard across the fight.
@@ -338,7 +339,7 @@ function isTrace(){ return (state?.mode ?? comboMode) === 'trace'; }
 const BOMB_HIT = 20, BOMB_MISS = 7;    // -33% across the board
 const EMPOWER_MAX = 5;           // stacks one tile can hold — caps the +30%/stack ramp
 const TRAIL_MAX = 8;             // how many steps of tail the board shows behind the signal
-const WALL_TURNS = 3;            // player moves a raised wall stands before it collapses
+const WALL_TURNS = 6;            // player moves a raised wall stands before it collapses
 const RAMP_PER_MOVE = 3;         // SIEGE's payload growth per move it goes un-struck
 const PROGRAM_COUNT = 7;         // total programs placed (incl. 1 strike + 1 guard)
 
@@ -915,7 +916,11 @@ function tickRelay(){
 function tickEscalation(){
   state.totalMoves++;
   if(!escalationOn) return;      // clock frozen — the elapsed turn is not counted
-  if(++state.movesTaken % ESCALATE_EVERY !== 0) return;
+  state.movesTaken++;
+  // A grace period first, so an ordinary fight can be finished before the ramp starts;
+  // after that it comes round every ESCALATE_EVERY moves.
+  if(state.movesTaken < ESCALATE_START) return;
+  if((state.movesTaken - ESCALATE_START) % ESCALATE_EVERY !== 0) return;
   state.escalation++;
   applyEnemyScaling();
   log('dmg','⚠ ESCALATION ×'+state.escalation+' — enemy power +'
@@ -1047,9 +1052,10 @@ function dealToPlayer(amt, src){
   // COMBO SHIELD changes the price from "all of it" to a fixed toll, so a long combo
   // survives a hit it would otherwise have ended. It never drops below the HEAD START
   // floor, so the two powers stack the way the player would expect.
-  // MOVE mode: a landed hit costs momentum. TRACE mode keeps the original rule, where
-  // the commit is the boundary and a hit does not touch the combo.
-  if(dmg > 0 && !isTrace()){
+  // Applies in BOTH modes. Trace mode also resets on its commit, but a hit costs the
+  // combo either way — being hit is the thing that ends a streak, whichever model is
+  // running.
+  if(dmg > 0){
     const toll = powerVal('comboShield');
     if(toll){
       const floor = powerVal('startCombo');
@@ -1256,9 +1262,10 @@ function render(keepFiring){
   escRow.style.display = state.escalation ? 'flex' : 'none';
   document.getElementById('escText').textContent =
     '+' + Math.round(ESCALATE_PCT * state.escalation * 100) + '%';
-  document.getElementById('escNextText').textContent = escalationOn
-    ? (ESCALATE_EVERY - (state.movesTaken % ESCALATE_EVERY)) + ' moves'
-    : 'paused';
+  document.getElementById('escNextText').textContent = !escalationOn ? 'paused'
+    : state.movesTaken < ESCALATE_START
+      ? (ESCALATE_START - state.movesTaken) + ' moves'
+      : (ESCALATE_EVERY - ((state.movesTaken - ESCALATE_START) % ESCALATE_EVERY)) + ' moves';
   document.getElementById('movesText').textContent = state.totalMoves;
 
   // Floating readout over the board — the same two numbers, where the player is looking.
