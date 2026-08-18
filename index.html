@@ -76,6 +76,10 @@
   .tile.prog.delay   { color: #c084fc; }
   .tile.prog.empower { color: #4ade80; }
   .tile.prog.relay   { color: #a78bfa; }
+  .tile.prog.aegis   { color: #38bdf8; }
+  /* Dormant: the tile is still there, it just cannot answer yet. */
+  .tile.dormant { filter: grayscale(.8) brightness(.55); }
+  .tile .dormbadge { position:absolute; top:2px; left:3px; font-size:10px; color:#94a3b8; }
   .tile .relaybadge { position:absolute; bottom:2px; right:3px; font-size:10px; color:#a78bfa; }
   .tile.empowered { box-shadow: inset 0 0 0 2px #4ade80; }
   .tile .empbadge { position:absolute; bottom:2px; left:3px; font-size:10px; color:#4ade80; }
@@ -104,6 +108,18 @@
     position: absolute; top: 2px; right: 4px;
     font-size: 10px; color: #22c55e;
   }
+  /* The signal's tile rattles once the combo is worth protecting — nothing under
+     SHAKE_MIN, ramping to a hard shake at SHAKE_MAX. --shake (0..1) is set per render,
+     and drives amplitude and speed together so it reads as tension rather than noise. */
+  .tile.signal.shaking {
+    animation: tile-shake calc(0.42s - var(--shake, 0) * 0.24s) linear infinite;
+  }
+  @keyframes tile-shake {
+    0%, 100% { transform: translate(0, 0); }
+    25%  { transform: translate(calc(var(--shake) * -2.6px), calc(var(--shake) * 1.4px)); }
+    50%  { transform: translate(calc(var(--shake) * 2.2px),  calc(var(--shake) * -2.0px)); }
+    75%  { transform: translate(calc(var(--shake) * 1.6px),  calc(var(--shake) * 2.2px)); }
+  }
   .tile.signal { box-shadow: inset 0 0 0 2px #22d3ee; }
   .tile.signal .dot {
     position: absolute; width: 14px; height: 14px; border-radius: 50%;
@@ -126,6 +142,23 @@
   .hp-fill { background:#22c55e; height: 100%; transition: width .2s; }
   .hp-fill.enemy { background:#ef4444; }
   .block-badge { color:#38bdf8; font-size: 12px; }
+  /* One chip per charge: amount, with its remaining turns as a superscript. */
+  .blk-charge { display:inline-flex; align-items:flex-start; gap:1px; padding:1px 4px;
+                border:1px solid rgba(56,189,248,.5); background:rgba(56,189,248,.10);
+                font-weight:700; }
+  .blk-turns  { font-size:9px; color:#7dd3fc; }
+  .blk-plus   { color:#475569; margin:0 3px; }
+  /* The charge that goes next move — it should be spent, not saved. */
+  .blk-charge.lapsing { border-color:#fbbf24; color:#fde68a; animation: blk-lapsing 1s ease-in-out infinite; }
+  @keyframes blk-lapsing { 0%,100%{opacity:1} 50%{opacity:.55} }
+  /* Expiry: the badge flashes once as the turn's timers finish resolving. */
+  .block-badge.expired { animation: blk-expire .55s ease-out; }
+  @keyframes blk-expire {
+    0%   { text-shadow:0 0 12px #fbbf24; transform:translateX(0) scale(1.06); }
+    35%  { transform:translateX(-3px); }
+    65%  { transform:translateX(3px); }
+    100% { text-shadow:none; transform:translateX(0) scale(1); }
+  }
 
   #enemies { display:flex; gap:10px; flex-wrap:wrap; }
   .enemy {
@@ -230,6 +263,7 @@
             <b>Commit + traceback:</b> stepping ARMS programs, <b>SPACE</b> fires the armed chain in reverse, then the signal respawns and combo resets — a hit does not clear it.<br>
             Each move = +1 combo (+10% signal strength). Moving decrements enemy cooldowns. Orange bars are walls.<br>
             <b>From move 20, the enemy gains +20% power every 10 moves</b> — stalling is not a strategy.<br>
+            Block charges are listed separately with their own countdowns — two grants expire a move apart, not together.<br>
             <b>Any damage that gets through resets your combo</b> — blocked damage does not, so GUARD protects the streak as well as the health.<br>
             <b>POWERS</b> below are toggle-able run modifiers; they persist across Reset so two runs can be compared on the same picks.
           </div>
@@ -332,7 +366,9 @@ const ESCALATE_EVERY = 10;         // moves between escalations after that
 const ESCALATE_PCT   = 0.20;       // enemy power gained per escalation
 // Block is banked in CHARGES, each with its own short life, so shielding is something
 // you spend on the turn you need it rather than a pool you hoard across the fight.
-const BLOCK_TURNS_DEFAULT = 2;     // player moves a banked block charge survives
+const BLOCK_TURNS_DEFAULT = 3;     // player moves a banked block charge survives
+const AEGIS_MULT    = 3;           // AEGIS banks this many times GUARD's block…
+const AEGIS_DORMANT = 2;           // …then cannot fire again for this many moves
 const CHAIN_STEP_MS = 260;         // pace the backward chain resolves at, in TRACE mode
 // RELAY: activating it starts a RUN of N moves (N = base, +1 per RELAY_PER_COMBO combo
 // held when it fires). On each of those moves it activates ONE random adjacent program.
@@ -340,6 +376,9 @@ const CHAIN_STEP_MS = 260;         // pace the backward chain resolves at, in TR
 // the run fans across the whole cluster before it doubles up on anyone.
 const RELAY_BASE       = 1;        // moves of activation per trigger
 const RELAY_PER_COMBO  = 5;        // +1 more move for every this much combo when it fires
+const RELAY_MAX_CHAIN  = 12;       // hard stop on relay->relay chaining, so it cannot loop
+const SHAKE_MIN = 5;               // combo at which the signal's tile starts to rattle
+const SHAKE_MAX = 15;              // combo at which the rattle is at full strength
 
 // Two combat models, switchable before START and locked for the fight:
 //   'move'  — every program fires the instant you step on it, at the current combo.
@@ -418,6 +457,8 @@ const PROGRAMS = {
              resolve:(api,k)=>{ const base = api.cstrikeRamp(); api.dealDamage(base, 'C-STRIKE(base '+base+')', k); } },
   guard:   { abbr:'GRD', name:'GUARD',    desc:'gain 10 block (expires — see the BLOCK LASTS dial)', resolveOn:'trace',
              resolve:(api,k)=> api.addBlock(GUARD_BLOCK, 'GUARD', k) },
+  aegis:   { abbr:'AEG', name:'AEGIS',    desc:'gain 3x GUARD block, then dormant for 2 moves', resolveOn:'trace',
+             resolve:(api,k)=> api.aegis(k) },
   combo:   { abbr:'CMB', name:'COMBO',    desc:'+3 combo', resolveOn:'arm',
              resolve:(api,k)=> api.addCombo(COMBO_GAIN) },
   delay:   { abbr:'DLY', name:'DELAY',    desc:'+2 cd to a random enemy ability', resolveOn:'arm',
@@ -569,9 +610,10 @@ let escalationOn = true;
 // constant because it is the single number that decides whether defending is worth a
 // step at all. Lives outside state, so a Reset keeps whatever is being tested.
 let blockTurns = BLOCK_TURNS_DEFAULT;
-// True while RELAY is paying out, so a relayed RELAY cannot queue another round — a
-// cluster of them would otherwise compound forever off a single trigger.
-let relayGuard = false;
+// Depth of the current relay->relay chain. Relays are allowed to drive each other (that
+// is what makes a cluster worth building), so this is the stop that keeps a ring of them
+// from looping forever.
+let relayDepth = 0;
 // Everything that hurts the player is scaled here — ability damage, bombs, burn — so the
 // debug dial and the fight's own escalation compose in ONE place rather than each source
 // remembering to apply both.
@@ -582,7 +624,7 @@ function newState(){
   // Two GUARDs are guaranteed: with block expiring after blockTurns moves, a single one
   // cannot keep a shield up often enough for defending to be a live option at all.
   const bag = ['strike','guard','guard'];
-  const pool = ['strike','cstrike','guard','combo','delay','empower','relay'];
+  const pool = ['strike','cstrike','guard','aegis','combo','delay','empower','relay'];
   // Snapshot the shortfall BEFORE filling: `bag.length` grows with every push, so
   // re-reading it in the loop condition stops the fill halfway (that bug shipped as a
   // 5-program board when PROGRAM_COUNT said 7).
@@ -618,6 +660,7 @@ function newState(){
     // originKey -> { charges, counts } — a RELAY mid-run. `charges` is moves left;
     // `counts` is how many times it has driven each neighbour, which drives the pick.
     relays: {},
+    dormant: {},             // cellKey -> moves until the program can fire again (AEGIS)
     corruptSpreadTimer: 0,   // moves since the last spread
     totalMoves: 0,           // every successful move this combat — always counts
     movesTaken: 0,           // moves on the ESCALATION clock (frozen while it is off)
@@ -669,8 +712,12 @@ function tickBlock(){
   let lost = 0;
   state.player.blocks.forEach(b=>{ if(--b.turns <= 0) lost += b.amount; });
   state.player.blocks = state.player.blocks.filter(b=>b.turns > 0);
-  if(lost) log('blk','◇ '+lost+' block expired');
+  if(lost){ log('blk','◇ '+lost+' block expired'); blockExpired = lost; }
 }
+
+// Set when a charge lapsed this turn; the render at the END of the turn plays the cue,
+// so it lands after everything else has resolved rather than mid-resolution.
+let blockExpired = 0;
 
 function strengthMult(){ return 1 + (0.1 + powerVal('comboBonus')) * state.combo; }
 
@@ -762,6 +809,7 @@ function tryMove(dr,dc){
   // is a real cost, and letting it deepen makes that cost worse.
   const rot = state.corrupt.get(nk);
   activateTile(nk);                 // the tile fires now, at the current multiplier
+  tickRelay();                      // …and any running RELAY pays out immediately after it
   if(rot){
     state.corrupt.delete(nk);
     log('sys','◇ scrubbed corruption @'+nk+' (fired at -'+Math.round(DEBUFF_PER_STACK*rot.stacks*100)+'%)');
@@ -792,6 +840,9 @@ function activateTile(k){
 function resolveProgramAt(k){
   const p = PROGRAMS[state.programs[k]];
   if(!p) return;
+  // A dormant program is still on the board and still gets stepped on; it simply has
+  // nothing to give until it wakes.
+  if(state.dormant[k]){ log('sys','◇ '+p.name+' is dormant ('+state.dormant[k]+' left)'); return; }
   firingCell = k;
   p.resolve(PROGRAM_API, k);
 }
@@ -803,6 +854,13 @@ const PROGRAM_API = {
     const emp = 1 + EMPOWER_PCT * (state.empower[k] || 0);
     const deb = corruptMult(k);
     dealStrike(base * emp * deb * strengthMult(), label, emp, deb);
+  },
+  /** AEGIS: a big shield, paid for with downtime rather than with a step. */
+  aegis(k){
+    const deb = corruptMult(k);
+    const blk = bankBlock(GUARD_BLOCK * AEGIS_MULT * deb * strengthMult());
+    state.dormant[k] = AEGIS_DORMANT + 1;   // +1: this move's tick spends one
+    log('blk','AEGIS → +' + blk + ' block, dormant ' + AEGIS_DORMANT + ' moves');
   },
   addBlock(base, label, k){
     const deb = corruptMult(k);
@@ -827,7 +885,6 @@ const PROGRAM_API = {
    * walking back over it extends the run rather than restarting the rotation.
    */
   queueRelay(k){
-    if(relayGuard) return;   // fired BY a relay — it does not get to start its own
     if(!relayNeighbours(k).length){ log('cmb','RELAY → nothing adjacent to drive'); return; }
 
     const n = RELAY_BASE + Math.floor(state.combo / RELAY_PER_COMBO);
@@ -835,6 +892,11 @@ const PROGRAM_API = {
     run.charges += n;
     log('cmb','RELAY → driving an adjacent program for the next '+run.charges+' move'
       +(run.charges>1?'s':''));
+    // Cut the queue: the first payout lands RIGHT NOW, immediately after the RELAY that
+    // started it, rather than waiting for the end of the turn. A RELAY driven this way
+    // starts its own run and pays out too, so relays lengthen the chain instead of
+    // stopping it.
+    payRelay(k);
   },
 
   empowerNeighbors(k){
@@ -881,7 +943,7 @@ function enemyTick(){
   state.enemies.forEach(e=>{ if(e.alive) e.abilities.forEach(i => tickAbility(e, i, true)); });
   tickCorruption();                   // rot matures, and spreads every other move
   decayWalls();                       // walls are temporary — they stand for WALL_TURNS moves
-  tickRelay();                        // RELAY pays out one queued activation per move
+  tickDormant();                      // dormant programs wake up
   tickBlock();                        // banked block ages out after blockTurns moves
   tickEscalation();                   // the fight itself gets harder the longer it runs
   checkPlayerDead();
@@ -896,41 +958,60 @@ function relayNeighbours(k){
 }
 
 /**
- * Spend one move of every running RELAY. Each picks ONE random adjacent program, but
- * weighted by history: a neighbour it has driven fewest times always wins, so the run
- * covers every valid neighbour once before any of them gets a second turn. Ties are
- * broken at random, which is where the "random adjacent" part lives.
+ * Spend ONE charge of the run at `origin`, resolving its pick immediately.
  *
- * What "activate" means follows the mode: in MOVE mode the program resolves on the spot;
- * in TRACE mode it is ARMED instead, pushed onto the path so the next commit fires it.
+ * The pick is random among the adjacent programs the run has driven FEWEST times, so a
+ * run covers every valid neighbour once before doubling up. Dormant programs are skipped
+ * while any awake neighbour is available — a run should not spend itself on a tile that
+ * cannot answer.
+ *
+ * A relayed RELAY starts its own run and pays out in turn, so relays lengthen the chain.
+ * RELAY_MAX_CHAIN is the stop that keeps a ring of them from looping forever.
  */
-function tickRelay(){
-  for(const [origin, run] of Object.entries(state.relays)){
-    if(run.charges <= 0){ delete state.relays[origin]; continue; }
+function payRelay(origin){
+  const run = state.relays[origin];
+  if(!run || run.charges <= 0){ delete state.relays[origin]; return; }
 
-    const targets = relayNeighbours(origin);
-    if(!targets.length){ delete state.relays[origin]; continue; }
+  const all = relayNeighbours(origin);
+  if(!all.length){ delete state.relays[origin]; return; }
+  // Prefer awake tiles; fall back to the full set only if everything adjacent is dormant.
+  const awake   = all.filter(nk => !state.dormant[nk]);
+  const targets = awake.length ? awake : all;
 
-    run.charges--;
-    const min  = Math.min(...targets.map(nk => run.counts[nk] || 0));
-    const pick = targets.filter(nk => (run.counts[nk] || 0) === min);
-    const k    = pick[rand(pick.length)];
-    run.counts[k] = (run.counts[k] || 0) + 1;
-    if(run.charges <= 0) delete state.relays[origin];
+  run.charges--;
+  const min  = Math.min(...targets.map(nk => run.counts[nk] || 0));
+  const pick = targets.filter(nk => (run.counts[nk] || 0) === min);
+  const k    = pick[rand(pick.length)];
+  run.counts[k] = (run.counts[k] || 0) + 1;
+  if(run.charges <= 0) delete state.relays[origin];
 
-    if(isTrace()){
-      const [r,c] = k.split(',').map(Number);
-      state.path.push({ r, c });        // armed — the commit will fire it
-      if(state.path.length > TRAIL_MAX) state.path.shift();
-      log('cmb','RELAY → armed '+PROGRAMS[state.programs[k]].name+' @'+k);
-    } else {
-      log('cmb','RELAY → '+PROGRAMS[state.programs[k]].name+' @'+k);
-      // A relayed RELAY does not start its own run, or a cluster compounds without bound.
-      relayGuard = true;
-      resolveProgramAt(k);
-      relayGuard = false;
-    }
+  if(isTrace()){
+    const [r,c] = k.split(',').map(Number);
+    state.path.push({ r, c });        // armed — the commit will fire it
+    if(state.path.length > TRAIL_MAX) state.path.shift();
+    log('cmb','RELAY → armed '+PROGRAMS[state.programs[k]].name+' @'+k);
+    return;
   }
+
+  if(relayDepth >= RELAY_MAX_CHAIN){ log('cmb','RELAY → chain capped at '+RELAY_MAX_CHAIN); return; }
+  relayDepth++;
+  log('cmb','RELAY → '+PROGRAMS[state.programs[k]].name+' @'+k
+    + (relayDepth>1 ? ' (chain '+relayDepth+')' : ''));
+  resolveProgramAt(k);
+  relayDepth--;
+}
+
+/** Dormant programs count down on the player's moves, like every other timer. */
+function tickDormant(){
+  for(const [k, turns] of Object.entries(state.dormant)){
+    if(turns <= 1){ delete state.dormant[k]; log('sys','◇ '+PROGRAMS[state.programs[k]].name+' woke @'+k); }
+    else state.dormant[k] = turns - 1;
+  }
+}
+
+/** Every running RELAY spends one charge — called once per move, inline after the step. */
+function tickRelay(){
+  for(const origin of Object.keys(state.relays)) payRelay(origin);
 }
 
 // Every ESCALATE_EVERY moves the whole board hits harder. Applied through the same
@@ -1173,6 +1254,7 @@ function dealStrike(raw, label, emp, deb){
 function startWave(n){
   state.wave = n;
   state.player.blocks = [];          // block does not carry between waves
+  state.burn.clear();                // and neither does the fire left on the board
   for(let i=0;i<WAVE_SIZE;i++) state.enemies.push(makeEnemy(rollType(), state.nextEnemyId++));
   state.targetId = null;
   // new BLIGHTs auto-cast on wave entry (older waves are already dead)
@@ -1246,6 +1328,7 @@ function render(keepFiring){
       t.innerHTML='<span class="abbr">'+PROGRAMS[type].abbr+'</span>';
       if(armCount[k]) t.innerHTML+='<span class="arms">×'+armCount[k]+'</span>';
       if(state.relays[k]?.charges) t.innerHTML+='<span class="relaybadge">⟳'+state.relays[k].charges+'</span>';
+      if(state.dormant[k]){ t.classList.add('dormant'); t.innerHTML+='<span class="dormbadge">z'+state.dormant[k]+'</span>'; }
       if(state.empower[k]){ t.classList.add('empowered'); t.innerHTML+='<span class="empbadge">+'+Math.round(EMPOWER_PCT*state.empower[k]*100)+'%</span>'; }
       if(canRearrange()){ t.classList.add('draggable'); t.draggable=true; }
     }
@@ -1261,6 +1344,14 @@ function render(keepFiring){
     if(k in bombMark){ t.insertAdjacentHTML('beforeend','<div class="bomb-marker'+(bombMark[k]?' intense':'')+'"></div>'); }
     if(state.signal && state.signal.r===r && state.signal.c===c && state.phase==='moving'){
       t.classList.add('signal'); t.innerHTML+='<div class="dot"></div>';
+      // How much is riding on this signal. It starts the moment combo REACHES SHAKE_MIN
+      // (a floor of 0.15 so the first step of it is actually visible) and ramps to full
+      // at SHAKE_MAX.
+      if(state.combo >= SHAKE_MIN){
+        const t01 = Math.min(1, (state.combo - SHAKE_MIN) / (SHAKE_MAX - SHAKE_MIN));
+        t.classList.add('shaking');
+        t.style.setProperty('--shake', (0.15 + 0.85 * t01).toFixed(2));
+      }
     }
     if(keepFiring && firingCell===k) t.classList.add('firing');
     // walls sit on this tile's right / bottom edge (child divs to avoid ::after clash)
@@ -1271,12 +1362,18 @@ function render(keepFiring){
   // player
   document.getElementById('hpText').textContent = state.player.hp+' / '+state.player.maxHp;
   document.getElementById('hpFill').style.width = (100*state.player.hp/state.player.maxHp)+'%';
-  // Show the total plus how soon the next charge lapses, so a shield about to vanish is
-  // visible while there is still a turn left to use it.
+  // Charges are listed SEPARATELY, each with its own countdown, because they expire on
+  // separate clocks — 10 banked last move and 10 banked this move are two shields that
+  // lapse a move apart, not one 20 that goes all at once. A single total hid that.
   const blkTotal = blockTotal();
-  const soonest = state.player.blocks.length ? Math.min(...state.player.blocks.map(b=>b.turns)) : 0;
-  document.getElementById('blockText').textContent =
-    blkTotal>0 ? '🛡 '+blkTotal+' block ('+soonest+' turn'+(soonest===1?'':'s')+' left)' : '';
+  const blkEl = document.getElementById('blockText');
+  if(blkTotal <= 0){ blkEl.innerHTML = ''; }
+  else {
+    const parts = [...state.player.blocks].sort((a,b)=>a.turns-b.turns)
+      .map(b=>'<span class="blk-charge'+(b.turns<=1?' lapsing':'')+'">'+b.amount
+              +'<span class="blk-turns">⏳'+b.turns+'</span></span>');
+    blkEl.innerHTML = '🛡 <b>'+blkTotal+'</b> = ' + parts.join('<span class="blk-plus">+</span>');
+  }
   document.getElementById('comboText').textContent = state.combo;
   document.getElementById('strengthText').textContent = Math.round(strengthMult()*100)+'%';
   // Escalation: the standing enemy-power bonus, plus the countdown to the next one, so
@@ -1290,6 +1387,14 @@ function render(keepFiring){
       ? (ESCALATE_START - state.movesTaken) + ' moves'
       : (ESCALATE_EVERY - ((state.movesTaken - ESCALATE_START) % ESCALATE_EVERY)) + ' moves';
   document.getElementById('movesText').textContent = state.totalMoves;
+
+  // Expiry cue — played once, after the turn is fully resolved.
+  if(blockExpired){
+    const el = document.getElementById('blockText');
+    el.classList.remove('expired'); void el.offsetWidth; el.classList.add('expired');
+    setTimeout(()=> el.classList.remove('expired'), 600);
+    blockExpired = 0;
+  }
 
   // Floating readout over the board — the same two numbers, where the player is looking.
   const hud = document.getElementById('comboHud');
