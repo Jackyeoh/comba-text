@@ -142,7 +142,18 @@
   .panel { min-width: 240px; }
   .panel h2 { font-size: 13px; color: #7dd3fc; margin: 0 0 8px; text-transform: uppercase; letter-spacing: 1px; }
 
-  .hp-bar { background:#1f2937; height: 16px; position: relative; margin: 4px 0 2px; }
+  .hp-bar { background:#1f2937; height: 16px; position: relative; margin: 4px 0 2px; overflow:hidden; }
+  /* Incoming: a hatched red band ending exactly at the current health edge, so it reads
+     as "this much of what you have is already spoken for". */
+  .hp-incoming {
+    position:absolute; top:0; height:100%; width:0; display:none;
+    background: repeating-linear-gradient(45deg,
+      rgba(239,68,68,.85) 0 4px, rgba(127,29,29,.85) 4px 8px);
+    animation: hp-incoming-pulse 1s ease-in-out infinite;
+  }
+  .hp-incoming.on { display:block; }
+  @keyframes hp-incoming-pulse { 0%,100%{opacity:.95} 50%{opacity:.5} }
+  .incoming-note { font-size:11px; color:#f87171; font-weight:700; min-height:13px; }
   .hp-fill { background:#22c55e; height: 100%; transition: width .2s; }
   .hp-fill.enemy { background:#ef4444; }
   .block-badge { color:#38bdf8; font-size: 12px; }
@@ -244,7 +255,12 @@
         <div class="panel">
           <h2>Player</h2>
           <div class="stat-row"><span>HP</span><span id="hpText"></span></div>
-          <div class="hp-bar"><div class="hp-fill" id="hpFill"></div></div>
+          <div class="hp-bar">
+            <div class="hp-fill" id="hpFill"></div>
+            <!-- The slice of the bar the next move would take, sitting at the health edge. -->
+            <div class="hp-incoming" id="hpIncoming"></div>
+          </div>
+          <div class="incoming-note" id="incomingText"></div>
           <div class="block-badge" id="blockText"></div>
           <div class="stat-row" style="margin-top:8px">
             <span>Combo</span><span id="comboText"></span>
@@ -267,8 +283,8 @@
           <div class="keys">
             <b>Setup:</b> drag a program onto an empty tile to move it, or onto another to swap — then START.<br>
             <b>Combat:</b> Arrows / WASD move signal &nbsp;·&nbsp; <b>click an enemy</b> to target it. Layout is locked.<br>
-            <b>Move-activate:</b> each step fires the tile you land on, and a landed hit clears your combo.<br>
-            <b>Commit + traceback:</b> stepping ARMS programs, <b>SPACE</b> fires the armed chain in reverse, then the signal respawns and combo resets — a hit does not clear it.<br>
+            <b>Move-activate:</b> each step fires the tile you land on — "on arm" and "on commit" alike. A landed hit clears your combo.<br>
+            <b>Commit + traceback:</b> stepping ARMS programs — "on arm" ones pay out as you pass, "on commit" ones wait. <b>SPACE</b> fires the armed chain in reverse; the signal then respawns and combo resets.<br>
             Each move = +1 combo (+10% signal strength). Moving decrements enemy cooldowns. Orange bars are walls.<br>
             <b>From move 20, the enemy gains +20% power every 10 moves</b> — stalling is not a strategy.<br>
             Block charges are listed separately with their own countdowns — two grants expire a move apart, not together.<br>
@@ -357,7 +373,7 @@
 <script>
 // ---------- Config ----------
 const GRID = 5;                  // board is GRID x GRID; the CSS grid is driven off this
-const STRIKE_DMG = 10, GUARD_BLOCK = 6, COMBO_GAIN = 3, DELAY_CD = 2;
+const STRIKE_DMG = 10, GUARD_BLOCK = 3, COMBO_GAIN = 3, DELAY_CD = 2;
 const CSTRIKE_BASE = 8, CSTRIKE_RAMP = 3, EMPOWER_PCT = 0.30, BURN_DMG = 3;
 // Corruption: a STAGED, growing debuff rather than a flat one.
 //   seeded (half-filled tile, 1 stack) → next move it takes hold (full tile, 2 stacks)
@@ -462,25 +478,25 @@ function powerVal(id){
 //   'trace' — resolveOn 'arm' fires on the pass; resolveOn 'trace' waits for the
 //             backward chain SPACE kicks off.
 const PROGRAMS = {
-  strike:  { abbr:'STR', name:'STRIKE',   desc:'deal 10 dmg', resolveOn:'trace',
+  strike:  { abbr:'STR', name:'STRIKE',   desc:()=> 'on commit: deal ' + STRIKE_DMG + ' dmg', resolveOn:'trace',
              resolve:(api,k)=> api.dealDamage(STRIKE_DMG, 'STRIKE', k) },
-  cstrike: { abbr:'CST', name:'C-STRIKE', desc:'deal 8 dmg, +3 per C-STRIKE since your last hit', resolveOn:'trace',
+  cstrike: { abbr:'CST', name:'C-STRIKE', desc:()=> 'on commit: deal ' + CSTRIKE_BASE + ' dmg, +' + CSTRIKE_RAMP + ' per C-STRIKE since your last hit', resolveOn:'trace',
              resolve:(api,k)=>{ const base = api.cstrikeRamp(); api.dealDamage(base, 'C-STRIKE(base '+base+')', k); } },
-  guard:   { abbr:'GRD', name:'GUARD',    desc:'gain 10 block (expires — see the BLOCK LASTS dial)', resolveOn:'trace',
+  guard:   { abbr:'GRD', name:'GUARD',    desc:()=> 'on commit: gain ' + GUARD_BLOCK + ' block (lasts ' + blockTurns + ' moves)', resolveOn:'trace',
              resolve:(api,k)=> api.addBlock(GUARD_BLOCK, 'GUARD', k) },
-  aegis:   { abbr:'AEG', name:'AEGIS',    desc:'gain 3x GUARD block, then dormant for 2 moves', resolveOn:'trace',
+  aegis:   { abbr:'AEG', name:'AEGIS',    desc:()=> 'on commit: gain ' + Math.round(GUARD_BLOCK * AEGIS_MULT) + ' block, then dormant for ' + AEGIS_DORMANT + ' moves', resolveOn:'trace',
              resolve:(api,k)=> api.aegis(k) },
-  ward:    { abbr:'WRD', name:'WARD',     desc:'on arm: +2 block. Does nothing on activate.', resolveOn:'arm',
+  ward:    { abbr:'WRD', name:'WARD',     desc:()=> 'on arm: gain ' + WARD_BLOCK + ' block. Nothing on commit.', resolveOn:'arm',
              resolve:(api,k)=> api.addBlock(WARD_BLOCK, 'WARD', k) },
-  surge:   { abbr:'SRG', name:'SURGE',    desc:'on arm: +30% output to EVERY program on the board for 1 move', resolveOn:'arm',
+  surge:   { abbr:'SRG', name:'SURGE',    desc:()=> 'on arm: +' + Math.round(SURGE_PCT*100) + '% output to EVERY program for ' + SURGE_TURNS + ' move', resolveOn:'arm',
              resolve:(api,k)=> api.surge() },
-  combo:   { abbr:'CMB', name:'COMBO',    desc:'+3 combo', resolveOn:'arm',
+  combo:   { abbr:'CMB', name:'COMBO',    desc:()=> 'on arm: +' + COMBO_GAIN + ' combo', resolveOn:'arm',
              resolve:(api,k)=> api.addCombo(COMBO_GAIN) },
-  delay:   { abbr:'DLY', name:'DELAY',    desc:'+2 cd to a random enemy ability', resolveOn:'arm',
+  delay:   { abbr:'DLY', name:'DELAY',    desc:()=> 'on arm: +' + DELAY_CD + ' cd to a random enemy ability', resolveOn:'arm',
              resolve:(api,k)=> api.delayRandomAbility() },
-  relay:   { abbr:'RLY', name:'RELAY',    desc:'for the next N moves, activates 1 random adjacent program (N = 1, +1 per 5 combo; least-driven first)', resolveOn:'arm',
+  relay:   { abbr:'RLY', name:'RELAY',    desc:()=> 'on arm: for ' + RELAY_BASE + ' move (+1 per ' + RELAY_PER_COMBO + ' combo), activates 1 random adjacent program — least-driven first', resolveOn:'arm',
              resolve:(api,k)=> api.queueRelay(k) },
-  empower: { abbr:'EMP', name:'EMPOWER',  desc:'+30% base dmg to adjacent programs (until you are hit)', resolveOn:'arm',
+  empower: { abbr:'EMP', name:'EMPOWER',  desc:()=> 'on arm: +' + Math.round(EMPOWER_PCT*100) + '% output to adjacent programs, max ' + EMPOWER_MAX + ' stacks (until you are hit)', resolveOn:'arm',
              resolve:(api,k)=> api.empowerNeighbors(k) },
 };
 
@@ -693,6 +709,36 @@ function newState(){
 }
 
 // The one place combo becomes damage. COMBO BONUS raises what each point is worth.
+/**
+ * Damage that will land on the PLAYER'S NEXT MOVE — every ability whose cooldown reaches
+ * zero on that tick. Read straight off the live ability instances, so it can never
+ * disagree with the countdowns on the enemy cards.
+ *
+ * Returns the raw total and what actually reaches health after standing block, because
+ * those are different decisions: one tells you the threat, the other tells you whether
+ * you are covered.
+ */
+function incomingDamage(){
+  let raw = 0;
+  for(const e of state.enemies){
+    if(!e.alive) continue;
+    for(const i of e.abilities){
+      if(i.cd > 1) continue;                       // not firing next tick
+      const ab = ABILITIES[i.kind];
+      if(i.kind === 'bomb'){
+        // The bomb's figure depends on where the signal is standing when it goes off.
+        const direct = i.bombTarget != null && signalKey() === i.bombTarget;
+        raw += scaleAtk(direct ? BOMB_HIT : BOMB_MISS);
+      } else if(i.kind === 'ramp'){
+        raw += i.dmg + (i.sinceAttacked || 0) + RAMP_PER_MOVE;   // it grows on the move too
+      } else if(i.dmg){
+        raw += i.dmg;
+      }
+    }
+  }
+  return { raw, afterBlock: Math.max(0, raw - blockTotal()) };
+}
+
 /** SURGE's board-wide output multiplier — 1 when it is not running. */
 function surgeMult(){ return state.surge > 0 ? (1 + SURGE_PCT) : 1; }
 
@@ -1391,6 +1437,18 @@ function render(keepFiring){
   }
   // player
   document.getElementById('hpText').textContent = state.player.hp+' / '+state.player.maxHp;
+  // Incoming preview — only while a fight is actually awaiting the next move.
+  const inc = (state.phase === 'moving' && !state.over) ? incomingDamage() : { raw:0, afterBlock:0 };
+  const incEl = document.getElementById('hpIncoming');
+  const hpPct = 100 * state.player.hp / state.player.maxHp;
+  const riskPct = Math.min(hpPct, 100 * inc.afterBlock / state.player.maxHp);
+  incEl.classList.toggle('on', inc.afterBlock > 0);
+  incEl.style.width = riskPct + '%';
+  incEl.style.left  = (hpPct - riskPct) + '%';          // sits at the health edge
+  document.getElementById('incomingText').textContent = inc.raw > 0
+    ? '⚠ ' + inc.raw + ' incoming' + (inc.raw !== inc.afterBlock
+        ? ' — ' + (inc.raw - inc.afterBlock) + ' blocked, ' + inc.afterBlock + ' to health' : '')
+    : '';
   document.getElementById('hpFill').style.width = (100*state.player.hp/state.player.maxHp)+'%';
   // Charges are listed SEPARATELY, each with its own countdown, because they expire on
   // separate clocks — 10 banked last move and 10 banked this move are two shields that
@@ -1473,10 +1531,11 @@ function render(keepFiring){
  */
 function programTooltip(type, k){
   const p = PROGRAMS[type];
-  const when = isTrace()
-    ? (p.resolveOn === 'arm' ? 'fires as you pass' : 'fires on COMMIT')
-    : 'fires when you step on it';
-  const bits = [p.name + ' — ' + p.desc, '(' + when + ')'];
+  // "on arm" / "on commit" is the vocabulary everywhere — it names WHEN the program
+  // resolves, which is a property of the program, not of the mode. (Move-activate simply
+  // resolves both classes the moment you step on the tile.)
+  const text = typeof p.desc === 'function' ? p.desc() : p.desc;
+  const bits = [p.name + ' [' + (p.resolveOn === 'arm' ? 'on arm' : 'on commit') + ']', text];
   if(state.dormant[k])        bits.push('DORMANT for ' + state.dormant[k] + ' more move(s)');
   if(state.relays[k]?.charges) bits.push('driving a neighbour for ' + state.relays[k].charges + ' more move(s)');
   const rot = state.corrupt.get(k);
