@@ -75,6 +75,8 @@
   .tile.prog.combo   { color: #fbbf24; }
   .tile.prog.delay   { color: #c084fc; }
   .tile.prog.empower { color: #4ade80; }
+  .tile.prog.relay   { color: #a78bfa; }
+  .tile .relaybadge { position:absolute; bottom:2px; right:3px; font-size:10px; color:#a78bfa; }
   .tile.empowered { box-shadow: inset 0 0 0 2px #4ade80; }
   .tile .empbadge { position:absolute; bottom:2px; left:3px; font-size:10px; color:#4ade80; }
   /* Corruption is drawn as a FILL so its two stages read at a glance: a small inset box
@@ -318,6 +320,12 @@ const ESCALATE_PCT   = 0.20;       // enemy power gained per escalation
 // you spend on the turn you need it rather than a pool you hoard across the fight.
 const BLOCK_TURNS = 2;             // player moves a banked block charge survives
 const CHAIN_STEP_MS = 260;         // pace the backward chain resolves at, in TRACE mode
+// RELAY: activating it starts a RUN of N moves (N = base, +1 per RELAY_PER_COMBO combo
+// held when it fires). On each of those moves it activates ONE random adjacent program.
+// The pick is not uniform: a neighbour it has not driven yet always beats one it has, so
+// the run fans across the whole cluster before it doubles up on anyone.
+const RELAY_BASE       = 1;        // moves of activation per trigger
+const RELAY_PER_COMBO  = 5;        // +1 more move for every this much combo when it fires
 
 // Two combat models, switchable before START and locked for the fight:
 //   'move'  — every program fires the instant you step on it, at the current combo.
@@ -400,6 +408,8 @@ const PROGRAMS = {
              resolve:(api,k)=> api.addCombo(COMBO_GAIN) },
   delay:   { abbr:'DLY', name:'DELAY',    desc:'+2 cd to a random enemy ability', resolveOn:'arm',
              resolve:(api,k)=> api.delayRandomAbility() },
+  relay:   { abbr:'RLY', name:'RELAY',    desc:'for the next N moves, activates 1 random adjacent program (N = 1, +1 per 5 combo; least-driven first)', resolveOn:'arm',
+             resolve:(api,k)=> api.queueRelay(k) },
   empower: { abbr:'EMP', name:'EMPOWER',  desc:'+30% base dmg to adjacent programs (until you are hit)', resolveOn:'arm',
              resolve:(api,k)=> api.empowerNeighbors(k) },
 };
@@ -541,6 +551,9 @@ let enemyScale = { hp: 1, atk: 1 };
 // escalation counter FREEZES rather than resetting, so switching it back on resumes from
 // where the fight left off instead of handing the player a free reprieve.
 let escalationOn = true;
+// True while RELAY is paying out, so a relayed RELAY cannot queue another round — a
+// cluster of them would otherwise compound forever off a single trigger.
+let relayGuard = false;
 // Everything that hurts the player is scaled here — ability damage, bombs, burn — so the
 // debug dial and the fight's own escalation compose in ONE place rather than each source
 // remembering to apply both.
@@ -551,7 +564,7 @@ function newState(){
   // Two GUARDs are guaranteed: with block expiring after BLOCK_TURNS, a single one
   // cannot keep a shield up often enough for defending to be a live option at all.
   const bag = ['strike','guard','guard'];
-  const pool = ['strike','cstrike','guard','combo','delay','empower'];
+  const pool = ['strike','cstrike','guard','combo','delay','empower','relay'];
   for(let i=0;i<PROGRAM_COUNT-bag.length;i++) bag.push(pool[rand(pool.length)]);
   // ensure at least the required ones present (they are)
   // cluster placement: pick a center, take the nearest N tiles so programs
@@ -580,6 +593,9 @@ function newState(){
     walls: new Map(),    // edge key -> turns left; the signal cannot cross while it stands
     // tileKey -> { stacks, full, timer } — BLIGHT's rot. See DEBUFF_PER_STACK.
     corrupt: new Map(),
+    // originKey -> { charges, counts } — a RELAY mid-run. `charges` is moves left;
+    // `counts` is how many times it has driven each neighbour, which drives the pick.
+    relays: {},
     corruptSpreadTimer: 0,   // moves since the last spread
     totalMoves: 0,           // every successful move this combat — always counts
     movesTaken: 0,           // moves on the ESCALATION clock (frozen while it is off)
@@ -745,7 +761,14 @@ function activateTile(k){
   // In TRACE mode only the on-arm programs pay out as you pass; the rest wait for the
   // chain. In MOVE mode everything fires here.
   if(isTrace() && p.resolveOn !== 'arm') return;
-  firingCell = k;                 // highlight the tile that just paid out
+  resolveProgramAt(k);
+}
+
+/** Fire whatever is on a tile, ignoring the mode gate. RELAY's payouts come through here. */
+function resolveProgramAt(k){
+  const p = PROGRAMS[state.programs[k]];
+  if(!p) return;
+  firingCell = k;
   p.resolve(PROGRAM_API, k);
 }
 
@@ -771,6 +794,25 @@ const PROGRAM_API = {
     state.cstrikeCount++;
     return base;
   },
+  /**
+   * RELAY fires: start a run of N moves (base, +1 per RELAY_PER_COMBO combo held RIGHT
+   * NOW). Each of those moves activates one random adjacent program — chosen in
+   * tickRelay, not assigned here, so the run reacts to the board as it stands each turn.
+   *
+   * Re-triggering an already-running RELAY ADDS moves and keeps its drive counts, so
+   * walking back over it extends the run rather than restarting the rotation.
+   */
+  queueRelay(k){
+    if(relayGuard) return;   // fired BY a relay — it does not get to start its own
+    if(!relayNeighbours(k).length){ log('cmb','RELAY → nothing adjacent to drive'); return; }
+
+    const n = RELAY_BASE + Math.floor(state.combo / RELAY_PER_COMBO);
+    const run = state.relays[k] || (state.relays[k] = { charges: 0, counts: {} });
+    run.charges += n;
+    log('cmb','RELAY → driving an adjacent program for the next '+run.charges+' move'
+      +(run.charges>1?'s':''));
+  },
+
   empowerNeighbors(k){
     const [r,c] = k.split(',').map(Number);
     let n=0, capped=0;
@@ -815,9 +857,56 @@ function enemyTick(){
   state.enemies.forEach(e=>{ if(e.alive) e.abilities.forEach(i => tickAbility(e, i, true)); });
   tickCorruption();                   // rot matures, and spreads every other move
   decayWalls();                       // walls are temporary — they stand for WALL_TURNS moves
+  tickRelay();                        // RELAY pays out one queued activation per move
   tickBlock();                        // banked block ages out after BLOCK_TURNS moves
   tickEscalation();                   // the fight itself gets harder the longer it runs
   checkPlayerDead();
+}
+
+/** The adjacent cells holding a program — RELAY's valid targets, read fresh each move. */
+function relayNeighbours(k){
+  const [r,c] = k.split(',').map(Number);
+  return [[-1,0],[1,0],[0,-1],[0,1]]
+    .map(([dr,dc])=> key(r+dr, c+dc))
+    .filter(nk => state.programs[nk]);
+}
+
+/**
+ * Spend one move of every running RELAY. Each picks ONE random adjacent program, but
+ * weighted by history: a neighbour it has driven fewest times always wins, so the run
+ * covers every valid neighbour once before any of them gets a second turn. Ties are
+ * broken at random, which is where the "random adjacent" part lives.
+ *
+ * What "activate" means follows the mode: in MOVE mode the program resolves on the spot;
+ * in TRACE mode it is ARMED instead, pushed onto the path so the next commit fires it.
+ */
+function tickRelay(){
+  for(const [origin, run] of Object.entries(state.relays)){
+    if(run.charges <= 0){ delete state.relays[origin]; continue; }
+
+    const targets = relayNeighbours(origin);
+    if(!targets.length){ delete state.relays[origin]; continue; }
+
+    run.charges--;
+    const min  = Math.min(...targets.map(nk => run.counts[nk] || 0));
+    const pick = targets.filter(nk => (run.counts[nk] || 0) === min);
+    const k    = pick[rand(pick.length)];
+    run.counts[k] = (run.counts[k] || 0) + 1;
+    if(run.charges <= 0) delete state.relays[origin];
+
+    if(isTrace()){
+      const [r,c] = k.split(',').map(Number);
+      state.path.push({ r, c });        // armed — the commit will fire it
+      if(state.path.length > TRAIL_MAX) state.path.shift();
+      log('cmb','RELAY → armed '+PROGRAMS[state.programs[k]].name+' @'+k);
+    } else {
+      log('cmb','RELAY → '+PROGRAMS[state.programs[k]].name+' @'+k);
+      // A relayed RELAY does not start its own run, or a cluster compounds without bound.
+      relayGuard = true;
+      resolveProgramAt(k);
+      relayGuard = false;
+    }
+  }
 }
 
 // Every ESCALATE_EVERY moves the whole board hits harder. Applied through the same
@@ -1127,6 +1216,7 @@ function render(keepFiring){
     if(type){ t.classList.add('prog', type);
       t.innerHTML='<span class="abbr">'+PROGRAMS[type].abbr+'</span>';
       if(armCount[k]) t.innerHTML+='<span class="arms">×'+armCount[k]+'</span>';
+      if(state.relays[k]?.charges) t.innerHTML+='<span class="relaybadge">⟳'+state.relays[k].charges+'</span>';
       if(state.empower[k]){ t.classList.add('empowered'); t.innerHTML+='<span class="empbadge">+'+Math.round(EMPOWER_PCT*state.empower[k]*100)+'%</span>'; }
       if(canRearrange()){ t.classList.add('draggable'); t.draggable=true; }
     }
